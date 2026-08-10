@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reposense.dev/events/parse.failed.v1.schema.json",
+  "title": "parse.failed.v1",
+  "type": "object",
+  "required": ["event_id", "event_type", "aggregate_id", "occurred_at", "producer", "payload_version", "trace_id", "payload"],
+  "properties": {
+    "event_id": {"type":"string"}, "event_type": {"const":"parse.failed.v1"},
+    "aggregate_id": {"type":"string"}, "occurred_at": {"type":"string", "format":"date-time"},
+    "producer": {"const":"repository-parser"}, "payload_version": {"const":1}, "trace_id": {"type":"string"},
+    "payload": {
+      "type":"object", "required":["snapshot_id", "error_code", "retryable"],
+      "properties":{"snapshot_id":{"type":"string"}, "error_code":{"type":"string"}, "retryable":{"type":"boolean"}},
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

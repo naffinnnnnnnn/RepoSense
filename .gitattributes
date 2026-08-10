@@ -1,0 +1,19 @@
+# 所有文本文件在仓库和工作区中统一使用 LF，避免跨平台换行符差异。
+* text=auto eol=lf
+
+# Windows 命令脚本保留 CRLF，确保与传统 Windows 工具兼容。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制文件禁止执行换行符转换。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.woff binary
+*.woff2 binary
