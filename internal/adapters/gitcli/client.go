@@ -13,10 +13,13 @@ import (
 	"github.com/reposense/reposense/internal/domain/repository"
 )
 
+// Git输出上限
 const maxGitOutput = 64 << 20
 
+// Client 无状态Git客户端
 type Client struct{}
 
+// New 构造函数
 func New() *Client { return &Client{} }
 
 func (c *Client) ResolveCommit(ctx context.Context, repoPath, ref string) (string, error) {

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reposense.dev/events/graph.published.v1.schema.json",
+  "title": "graph.published.v1",
+  "type": "object",
+  "required": ["event_id", "event_type", "aggregate_id", "occurred_at", "producer", "payload_version", "trace_id", "payload"],
+  "properties": {
+    "event_id": {"type": "string", "minLength": 1},
+    "event_type": {"const": "graph.published.v1"},
+    "aggregate_id": {"type": "string", "minLength": 1},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "producer": {"const": "code-knowledge-graph"},
+    "payload_version": {"const": 1},
+    "trace_id": {"type": "string"},
+    "payload": {
+      "type": "object",
+      "required": ["revision_id", "snapshot_id", "commit_sha", "nodes", "edges", "unresolved_targets", "algorithm_version"],
+      "properties": {
+        "revision_id": {"type": "string", "minLength": 1},
+        "snapshot_id": {"type": "string", "minLength": 1},
+        "commit_sha": {"type": "string", "minLength": 1},
+        "nodes": {"type": "integer", "minimum": 0},
+        "edges": {"type": "integer", "minimum": 0},
+        "unresolved_targets": {"type": "integer", "minimum": 0},
+        "algorithm_version": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

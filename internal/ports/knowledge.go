@@ -4,20 +4,25 @@ import (
 	"context"
 
 	"github.com/reposense/reposense/internal/domain/common"
+	"github.com/reposense/reposense/internal/domain/graph"
 	"github.com/reposense/reposense/internal/domain/repository"
 )
 
 // 以下 DTO 在编译期明确后续模块的边界，具体实现不属于当前里程碑。
-type GraphQuery struct {
-	Scope   common.Scope
-	RootIDs []string
-	Depth   int
+type GraphSource interface {
+	GraphInput(context.Context, common.Scope) (graph.BuildInput, error)
 }
-type GraphResult struct{ NodeIDs, EdgeIDs []string }
-type GraphRevision struct{ RevisionID, SnapshotID, Status string }
+
+type GraphRepository interface {
+	FindByIdempotencyKey(context.Context, common.Scope, string) (graph.Revision, bool, error)
+	RevisionBySnapshot(context.Context, common.Scope) (graph.Revision, error)
+	Save(context.Context, string, graph.Revision) error
+	Query(context.Context, graph.Query) (graph.Result, error)
+}
+
 type GraphStore interface {
-	ApplyRevision(context.Context, common.Scope, []repository.CodeArtifact) (GraphRevision, error)
-	Query(context.Context, GraphQuery) (GraphResult, error)
+	Build(context.Context, graph.BuildCommand) (graph.Revision, error)
+	Query(context.Context, graph.Query) (graph.Result, error)
 }
 
 type RetrievalRequest struct {

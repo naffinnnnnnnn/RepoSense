@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/reposense/reposense/internal/domain/common"
+	"github.com/reposense/reposense/internal/domain/graph"
 	"github.com/reposense/reposense/internal/domain/repository"
 )
 
@@ -19,6 +20,24 @@ type RepositoryStore struct {
 
 func NewRepositoryStore() *RepositoryStore {
 	return &RepositoryStore{results: map[string]repository.ParseResult{}, latest: map[string]string{}, snapshots: map[string]repository.Snapshot{}}
+}
+
+func (s *RepositoryStore) GraphInput(ctx context.Context, scope common.Scope) (graph.BuildInput, error) {
+	if err := scope.Validate(true); err != nil {
+		return graph.BuildInput{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return graph.BuildInput{}, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, result := range s.results {
+		if result.Snapshot.SnapshotID == scope.SnapshotID && result.Snapshot.TenantID == scope.TenantID && result.Snapshot.RepositoryID == scope.RepositoryID {
+			copy := cloneResult(result)
+			return graph.BuildInput{Snapshot: copy.Snapshot, Artifacts: copy.Artifacts, Relations: copy.Relations, DeletedPaths: copy.DeletedPaths}, nil
+		}
+	}
+	return graph.BuildInput{}, fmt.Errorf("snapshot not found")
 }
 func scopeKey(s common.Scope) string              { return s.TenantID + "\x00" + s.RepositoryID }
 func resultKey(s common.Scope, key string) string { return scopeKey(s) + "\x00" + key }

@@ -5,3 +5,8 @@ coverage.out
 web/node_modules/
 web/dist/
 
+# Local project design documents (not versioned)
+/ARCHITECTURE_AND_DEVELOPMENT_GUIDE.md
+/MODULE_DATA_DESIGN.md
+/PROJECT_DEFINITION.md
+/TECH_STACK_SELECTION.md

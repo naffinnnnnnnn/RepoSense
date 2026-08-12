@@ -3,6 +3,45 @@ info:
   title: RepoSense API
   version: 0.1.0
 paths:
+  /v1/repositories/{repository_id}/snapshots/{snapshot_id}/graph:
+    post:
+      summary: Build and atomically publish a versioned code knowledge graph
+      parameters:
+        - { in: path, name: repository_id, required: true, schema: { type: string } }
+        - { in: path, name: snapshot_id, required: true, schema: { type: string } }
+        - { in: header, name: Idempotency-Key, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GraphBuildCommand' }
+      responses:
+        '201':
+          description: Published immutable graph revision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GraphRevision' }
+        '400': { description: Invalid build command or graph input }
+        '404': { description: Snapshot or parent graph revision not found }
+        '409': { description: Idempotency or publication conflict }
+    get:
+      summary: Query a graph revision pinned to a repository snapshot
+      parameters:
+        - { in: path, name: repository_id, required: true, schema: { type: string } }
+        - { in: path, name: snapshot_id, required: true, schema: { type: string } }
+        - { in: query, name: tenant_id, required: true, schema: { type: string } }
+        - { in: query, name: root_id, schema: { type: array, items: { type: string } } }
+        - { in: query, name: depth, schema: { type: integer, minimum: 0, maximum: 10, default: 1 } }
+        - { in: query, name: direction, schema: { enum: [BOTH, OUTGOING, INCOMING], default: BOTH } }
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 10000, default: 500 } }
+      responses:
+        '200':
+          description: Bounded graph projection with source evidence
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GraphResult' }
+        '400': { description: Invalid query }
+        '404': { description: Graph revision or root not found }
   /v1/repositories/{repository_id}/parse:
     post:
       summary: 创建不可变仓库快照并解析其中的变更文件
@@ -31,6 +70,77 @@ paths:
         '409': { description: 幂等键或版本冲突 }
 components:
   schemas:
+    GraphBuildCommand:
+      type: object
+      required: [tenant_id, mode]
+      properties:
+        tenant_id: { type: string, minLength: 1 }
+        mode: { enum: [FULL, INCREMENTAL] }
+        artifact_ids: { type: array, uniqueItems: true, items: { type: string, minLength: 1 } }
+    GraphRevision:
+      type: object
+      required: [revision_id, snapshot_id, commit_sha, build_status, algorithm_version, stats]
+      properties:
+        revision_id: { type: string }
+        snapshot_id: { type: string }
+        parent_revision_id: { type: string }
+        commit_sha: { type: string }
+        build_status: { enum: [ACTIVE] }
+        algorithm_version: { type: string }
+        stats:
+          type: object
+          properties:
+            nodes: { type: integer, minimum: 0 }
+            edges: { type: integer, minimum: 0 }
+            unresolved_targets: { type: integer, minimum: 0 }
+            ambiguous_relations: { type: integer, minimum: 0 }
+    SourceRef:
+      type: object
+      required: [commit_sha, path, start_line, end_line, content_hash]
+      properties:
+        commit_sha: { type: string }
+        path: { type: string }
+        symbol_id: { type: string }
+        start_line: { type: integer, minimum: 1 }
+        end_line: { type: integer, minimum: 1 }
+        content_hash: { type: string }
+    GraphNode:
+      type: object
+      required: [node_id, entity_type, name, valid_from]
+      properties:
+        node_id: { type: string }
+        entity_type: { enum: [REPOSITORY, MODULE, FILE, CLASS, INTERFACE, FUNCTION, METHOD, IMPORT, CONFIG, DOCUMENT, PACKAGE, SYMBOL] }
+        artifact_id: { type: string }
+        name: { type: string }
+        qualified_name: { type: string }
+        properties: { type: object, additionalProperties: { type: string } }
+        source_ref: { $ref: '#/components/schemas/SourceRef' }
+        valid_from: { type: string }
+        valid_to: { type: string }
+    GraphEdge:
+      type: object
+      required: [edge_id, relation_type, from_node_id, to_node_id, evidence, confidence]
+      properties:
+        edge_id: { type: string }
+        relation_type: { enum: [CONTAINS, IMPORTS, CALLS, EXTENDS, IMPLEMENTS, DEPENDS_ON] }
+        from_node_id: { type: string }
+        to_node_id: { type: string }
+        evidence: { $ref: '#/components/schemas/SourceRef' }
+        confidence: { type: number, minimum: 0, maximum: 1 }
+    GraphResult:
+      type: object
+      required: [nodes, edges, diagnostics]
+      properties:
+        nodes: { type: array, items: { $ref: '#/components/schemas/GraphNode' } }
+        edges: { type: array, items: { $ref: '#/components/schemas/GraphEdge' } }
+        diagnostics:
+          type: object
+          required: [revision_id, visited, truncated, duration_ms]
+          properties:
+            revision_id: { type: string }
+            visited: { type: integer, minimum: 0 }
+            truncated: { type: boolean }
+            duration_ms: { type: integer, minimum: 0 }
     RepositorySyncCommand:
       type: object
       required: [tenant_id, ref]
