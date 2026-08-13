@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reposense.dev/schemas/events/qa.run.completed.v1.json",
+  "title": "Repository QA run completed v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "conversation_id", "snapshot_id", "status", "citation_count", "insufficient_evidence", "token_usage", "latency_ms", "model", "prompt_version"],
+  "properties": {
+    "run_id": { "type": "string", "minLength": 1 },
+    "conversation_id": { "type": "string", "minLength": 1 },
+    "snapshot_id": { "type": "string", "minLength": 1 },
+    "status": { "const": "COMPLETED" },
+    "citation_count": { "type": "integer", "minimum": 0 },
+    "insufficient_evidence": { "type": "boolean" },
+    "token_usage": { "type": "integer", "minimum": 0 },
+    "latency_ms": { "type": "integer", "minimum": 0 },
+    "model": { "type": "string", "minLength": 1 },
+    "prompt_version": { "type": "string", "minLength": 1 }
+  }
+}

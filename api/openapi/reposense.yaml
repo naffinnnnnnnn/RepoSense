@@ -3,6 +3,63 @@ info:
   title: RepoSense API
   version: 0.1.0
 paths:
+  /v1/repositories/{repository_id}/snapshots/{snapshot_id}/questions:
+    post:
+      summary: Ask an evidence-backed question against an exact repository snapshot
+      parameters:
+        - { in: path, name: repository_id, required: true, schema: { type: string } }
+        - { in: path, name: snapshot_id, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AgentAskCommand' }
+      responses:
+        '200':
+          description: SSE stream of ordered planning, retrieval, evaluation, and terminal events
+          content:
+            text/event-stream:
+              schema: { type: string, description: "Each data field is an AgentEvent JSON object; the stream ends with COMPLETED or FAILED." }
+        '400': { description: Invalid scope, locale, conversation, or question }
+        '403': { description: Missing repo:read permission }
+        '404': { description: Requested snapshot knowledge is unavailable }
+  /v1/repositories/{repository_id}/snapshots/{snapshot_id}/wiki:
+    post:
+      summary: Generate and atomically publish evidence-backed Wiki pages
+      parameters:
+        - { in: path, name: repository_id, required: true, schema: { type: string } }
+        - { in: path, name: snapshot_id, required: true, schema: { type: string } }
+        - { in: header, name: Idempotency-Key, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WikiGenerateCommand' }
+      responses:
+        '201':
+          description: Wiki generation completed and all requested pages were published
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WikiJob' }
+        '400': { description: Invalid scope, locale, page scope, or generation output }
+        '404': { description: Snapshot or graph revision not ready }
+        '409': { description: Idempotency or page revision conflict }
+  /v1/repositories/{repository_id}/snapshots/{snapshot_id}/wiki/pages/{slug}:
+    get:
+      summary: Get a Wiki page pinned to an exact repository snapshot
+      parameters:
+        - { in: path, name: repository_id, required: true, schema: { type: string } }
+        - { in: path, name: snapshot_id, required: true, schema: { type: string } }
+        - { in: path, name: slug, required: true, schema: { type: string } }
+        - { in: query, name: tenant_id, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Immutable Wiki page revision with source citations
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WikiPageRevision' }
+        '400': { description: Invalid scope or slug }
+        '404': { description: Wiki page not found for the requested snapshot }
   /v1/repositories/{repository_id}/snapshots/{snapshot_id}/graph:
     post:
       summary: Build and atomically publish a versioned code knowledge graph
@@ -42,6 +99,47 @@ paths:
               schema: { $ref: '#/components/schemas/GraphResult' }
         '400': { description: Invalid query }
         '404': { description: Graph revision or root not found }
+  /v1/repositories/{repository_id}/snapshots/{snapshot_id}/search:
+    post:
+      summary: Retrieve ranked code evidence from an exact repository snapshot
+      parameters:
+        - { in: path, name: repository_id, required: true, schema: { type: string } }
+        - { in: path, name: snapshot_id, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RetrievalRequest' }
+      responses:
+        '200':
+          description: Ranked, source-backed evidence with bounded context and diagnostics
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EvidenceBundle' }
+        '400': { description: Invalid query, strategy, filter, or top_k }
+        '404': { description: RAG index is not ready for the requested snapshot }
+        '503': { description: Vectorizer, reranker, or index storage is unavailable }
+  /v1/repositories/{repository_id}/snapshots/{snapshot_id}/visualizations:
+    post:
+      summary: Project a version-pinned code graph for interactive or embedded visualization
+      parameters:
+        - { in: path, name: repository_id, required: true, schema: { type: string } }
+        - { in: path, name: snapshot_id, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VisualizationQuery' }
+      responses:
+        '200':
+          description: Cytoscape-compatible nodes and edges, deterministic positions, source links, and optional Mermaid
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GraphProjection' }
+        '400': { description: Invalid scope, view, filter, depth, layout, or result limit }
+        '404': { description: Graph revision is unavailable for the requested snapshot }
+        '409': { description: Requested graph revision does not match the snapshot's published revision }
+        '503': { description: Graph query, layout, or projection cache is unavailable }
   /v1/repositories/{repository_id}/parse:
     post:
       summary: 创建不可变仓库快照并解析其中的变更文件
@@ -70,6 +168,79 @@ paths:
         '409': { description: 幂等键或版本冲突 }
 components:
   schemas:
+    AgentAskCommand:
+      type: object
+      required: [tenant_id, conversation_id, question, permissions]
+      properties:
+        tenant_id: { type: string, minLength: 1 }
+        conversation_id: { type: string, minLength: 1 }
+        user_id: { type: string }
+        question: { type: string, minLength: 1, maxLength: 8000 }
+        permissions:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          contains: { const: 'repo:read' }
+          items: { type: string, minLength: 1 }
+        locale: { enum: [zh-CN, en-US], default: zh-CN }
+    AgentEvent:
+      type: object
+      required: [run_id, type, sequence, occurred_at]
+      properties:
+        run_id: { type: string, minLength: 1 }
+        type: { enum: [RUN_STARTED, PLANNED, RETRIEVED, EVALUATED, COMPLETED, FAILED] }
+        sequence: { type: integer, minimum: 1 }
+        occurred_at: { type: string, format: date-time }
+        payload: { type: object, additionalProperties: true }
+    AgentAnswer:
+      type: object
+      required: [answer_md, citations, insufficient_evidence, model, prompt_version]
+      properties:
+        answer_md: { type: string, minLength: 1 }
+        citations: { type: array, items: { $ref: '#/components/schemas/SourceRef' } }
+        insufficient_evidence: { type: boolean }
+        warnings: { type: array, items: { type: string } }
+        model: { type: string, minLength: 1 }
+        prompt_version: { type: string, minLength: 1 }
+    WikiGenerateCommand:
+      type: object
+      required: [tenant_id, graph_revision_id]
+      properties:
+        tenant_id: { type: string, minLength: 1 }
+        graph_revision_id: { type: string, minLength: 1 }
+        locale: { enum: [zh-CN, en-US], default: zh-CN }
+        page_scope:
+          type: array
+          uniqueItems: true
+          items: { enum: [overview, architecture, modules, key-flows, interfaces, development-guide] }
+    WikiJob:
+      type: object
+      required: [job_id, snapshot_id, graph_revision_id, job_status, page_ids]
+      properties:
+        job_id: { type: string, minLength: 1 }
+        snapshot_id: { type: string, minLength: 1 }
+        graph_revision_id: { type: string, minLength: 1 }
+        job_status: { enum: [SUCCEEDED] }
+        page_ids: { type: array, items: { type: string, minLength: 1 }, uniqueItems: true }
+    WikiPageRevision:
+      type: object
+      required: [page_id, revision_no, snapshot_id, graph_revision_id, locale, slug, title, content_md, citations, generation_mode, review_status, model, prompt_version, content_hash]
+      properties:
+        page_id: { type: string, minLength: 1 }
+        revision_no: { type: integer, minimum: 1 }
+        snapshot_id: { type: string, minLength: 1 }
+        graph_revision_id: { type: string, minLength: 1 }
+        locale: { enum: [zh-CN, en-US] }
+        parent_page_id: { type: string }
+        slug: { type: string, minLength: 1 }
+        title: { type: string, minLength: 1 }
+        content_md: { type: string, minLength: 1 }
+        citations: { type: array, minItems: 1, items: { $ref: '#/components/schemas/SourceRef' } }
+        generation_mode: { enum: [AI, AI_ASSISTED, MANUAL] }
+        review_status: { enum: [DRAFT, APPROVED] }
+        model: { type: string, minLength: 1 }
+        prompt_version: { type: string, minLength: 1 }
+        content_hash: { type: string, pattern: '^sha256:' }
     GraphBuildCommand:
       type: object
       required: [tenant_id, mode]
@@ -141,6 +312,194 @@ components:
             visited: { type: integer, minimum: 0 }
             truncated: { type: boolean }
             duration_ms: { type: integer, minimum: 0 }
+    VisualizationQuery:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, graph_revision_id, view_type]
+      properties:
+        tenant_id: { type: string, minLength: 1 }
+        graph_revision_id: { type: string, minLength: 1 }
+        view_type: { enum: [REPOSITORY_MAP, MODULE_DEPENDENCY, CLASS_DIAGRAM, CALL_GRAPH, DATA_FLOW] }
+        root_ids: { type: array, uniqueItems: true, items: { type: string, minLength: 1 } }
+        depth: { type: integer, minimum: 0, maximum: 10, default: 0 }
+        filters:
+          type: object
+          additionalProperties: false
+          properties:
+            entity_types:
+              type: array
+              uniqueItems: true
+              items: { enum: [REPOSITORY, MODULE, FILE, CLASS, INTERFACE, FUNCTION, METHOD, IMPORT, CONFIG, DOCUMENT, PACKAGE, SYMBOL] }
+            relation_types:
+              type: array
+              uniqueItems: true
+              items: { enum: [CONTAINS, IMPORTS, CALLS, EXTENDS, IMPLEMENTS, DEPENDS_ON] }
+            direction: { enum: [BOTH, OUTGOING, INCOMING], default: BOTH }
+            min_confidence: { type: number, minimum: 0, maximum: 1, default: 0 }
+            languages: { type: array, uniqueItems: true, items: { type: string, minLength: 1 } }
+        layout: { enum: [DAG, GRID, RADIAL] }
+        theme: { enum: [light, dark], default: light }
+        limit: { type: integer, minimum: 1, maximum: 5000, default: 500 }
+        include_mermaid: { type: boolean, default: false }
+    VisualizationNode:
+      type: object
+      required: [id, label, entity_type]
+      properties:
+        id: { type: string, minLength: 1 }
+        label: { type: string }
+        entity_type: { type: string }
+        artifact_id: { type: string }
+        qualified_name: { type: string }
+        properties: { type: object, additionalProperties: { type: string } }
+    VisualizationEdge:
+      type: object
+      required: [id, source, target, label, type, confidence]
+      properties:
+        id: { type: string, minLength: 1 }
+        source: { type: string, minLength: 1 }
+        target: { type: string, minLength: 1 }
+        label: { type: string }
+        type: { enum: [CONTAINS, IMPORTS, CALLS, EXTENDS, IMPLEMENTS, DEPENDS_ON] }
+        confidence: { type: number, minimum: 0, maximum: 1 }
+        properties: { type: object, additionalProperties: { type: string } }
+    VisualizationSourceLink:
+      type: object
+      required: [commit_sha, path, start_line, end_line]
+      properties:
+        commit_sha: { type: string }
+        path: { type: string }
+        symbol_id: { type: string }
+        start_line: { type: integer, minimum: 1 }
+        end_line: { type: integer, minimum: 1 }
+    GraphProjection:
+      type: object
+      required: [projection_id, graph_revision_id, snapshot_id, view_type, theme, nodes, edges, layout, source_links, render_status, created_at, expires_at, diagnostics]
+      properties:
+        projection_id: { type: string, minLength: 1 }
+        graph_revision_id: { type: string, minLength: 1 }
+        snapshot_id: { type: string, minLength: 1 }
+        view_type: { enum: [REPOSITORY_MAP, MODULE_DEPENDENCY, CLASS_DIAGRAM, CALL_GRAPH, DATA_FLOW] }
+        theme: { enum: [light, dark] }
+        nodes: { type: array, items: { $ref: '#/components/schemas/VisualizationNode' } }
+        edges: { type: array, items: { $ref: '#/components/schemas/VisualizationEdge' } }
+        layout:
+          type: object
+          required: [algorithm, algorithm_version, positions]
+          properties:
+            algorithm: { enum: [DAG, GRID, RADIAL] }
+            algorithm_version: { type: string }
+            positions:
+              type: object
+              additionalProperties:
+                type: object
+                required: [x, y]
+                properties:
+                  x: { type: number }
+                  y: { type: number }
+        source_links:
+          type: object
+          additionalProperties: { $ref: '#/components/schemas/VisualizationSourceLink' }
+        mermaid: { type: string }
+        render_status: { const: READY }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        diagnostics:
+          type: object
+          required: [query_hash, graph_visited, input_nodes, input_edges, output_nodes, output_edges, truncated, cache_hit, duration_ms, layout_duration_ms]
+          properties:
+            query_hash: { type: string, pattern: '^sha256:' }
+            graph_visited: { type: integer, minimum: 0 }
+            input_nodes: { type: integer, minimum: 0 }
+            input_edges: { type: integer, minimum: 0 }
+            output_nodes: { type: integer, minimum: 0 }
+            output_edges: { type: integer, minimum: 0 }
+            truncated: { type: boolean }
+            cache_hit: { type: boolean }
+            duration_ms: { type: integer, minimum: 0 }
+            layout_duration_ms: { type: integer, minimum: 0 }
+            warnings: { type: array, items: { type: string } }
+    RetrievalRequest:
+      type: object
+      required: [tenant_id, query]
+      properties:
+        tenant_id: { type: string, minLength: 1 }
+        query: { type: string, minLength: 1, maxLength: 4096 }
+        strategies:
+          type: array
+          uniqueItems: true
+          items: { enum: [SYMBOL, KEYWORD, SEMANTIC, GRAPH, BM25, VECTOR] }
+        filters:
+          $ref: '#/components/schemas/RetrievalFilters'
+        top_k: { type: integer, minimum: 1, maximum: 100, default: 10 }
+    RetrievalFilters:
+      type: object
+      properties:
+        languages: { type: array, uniqueItems: true, items: { type: string, minLength: 1 } }
+        chunk_types:
+          type: array
+          uniqueItems: true
+          items: { enum: [FILE, MODULE, CLASS, INTERFACE, FUNCTION, METHOD, IMPORT, CONFIG, DOCUMENT] }
+        path_prefixes: { type: array, uniqueItems: true, items: { type: string, minLength: 1 } }
+        artifact_ids: { type: array, uniqueItems: true, items: { type: string, minLength: 1 } }
+      additionalProperties: false
+    RetrievalHit:
+      type: object
+      required: [document_id, artifact_id, source_ref, chunk_type, language, score, scores, reasons]
+      properties:
+        document_id: { type: string, minLength: 1 }
+        artifact_id: { type: string, minLength: 1 }
+        source_ref: { $ref: '#/components/schemas/SourceRef' }
+        chunk_type: { type: string }
+        language: { type: string }
+        score: { type: number, minimum: 0 }
+        scores:
+          type: object
+          required: [symbol, keyword, semantic, graph]
+          properties:
+            symbol: { type: number, minimum: 0 }
+            keyword: { type: number, minimum: 0 }
+            semantic: { type: number, minimum: 0 }
+            graph: { type: number, minimum: 0 }
+            rerank: { type: number, minimum: 0 }
+        reasons: { type: array, items: { enum: [symbol, keyword, semantic, graph] } }
+    EvidenceBundle:
+      type: object
+      required: [hits, context_bundle, diagnostics, artifact_ids, sources]
+      properties:
+        hits: { type: array, items: { $ref: '#/components/schemas/RetrievalHit' } }
+        context_bundle:
+          type: object
+          required: [items, character_count, truncated]
+          properties:
+            items:
+              type: array
+              items:
+                type: object
+                required: [document_id, artifact_id, text, source_ref, score]
+                properties:
+                  document_id: { type: string }
+                  artifact_id: { type: string }
+                  text: { type: string }
+                  source_ref: { $ref: '#/components/schemas/SourceRef' }
+                  score: { type: number, minimum: 0 }
+            character_count: { type: integer, minimum: 0 }
+            truncated: { type: boolean }
+        diagnostics:
+          type: object
+          required: [retrieval_id, query_hash, index_revision_id, algorithm_version, strategies, strategy_hits, candidates, duration_ms, cache_hit]
+          properties:
+            retrieval_id: { type: string }
+            query_hash: { type: string, pattern: '^sha256:' }
+            index_revision_id: { type: string }
+            algorithm_version: { type: string }
+            strategies: { type: array, items: { enum: [SYMBOL, KEYWORD, SEMANTIC, GRAPH] } }
+            strategy_hits: { type: object, additionalProperties: { type: integer, minimum: 0 } }
+            candidates: { type: integer, minimum: 0 }
+            duration_ms: { type: integer, minimum: 0 }
+            cache_hit: { type: boolean }
+            warnings: { type: array, items: { type: string } }
+        artifact_ids: { type: array, items: { type: string } }
+        sources: { type: array, items: { $ref: '#/components/schemas/SourceRef' } }
     RepositorySyncCommand:
       type: object
       required: [tenant_id, ref]

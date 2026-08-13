@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reposense.dev/events/proposal.applied.v1.schema.json",
+  "title": "proposal.applied.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "event_type", "aggregate_id", "occurred_at", "producer", "payload_version", "trace_id", "payload"],
+  "properties": {
+    "event_id": {"type": "string", "minLength": 1},
+    "event_type": {"const": "proposal.applied.v1"},
+    "aggregate_id": {"type": "string", "minLength": 1},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "producer": {"const": "coding-assistant"},
+    "payload_version": {"const": 1},
+    "trace_id": {"type": "string"},
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["proposal_id", "session_id", "snapshot_id", "base_commit_sha", "applied_commit_sha", "file_count", "principal_id"],
+      "properties": {
+        "proposal_id": {"type": "string", "minLength": 1},
+        "session_id": {"type": "string", "minLength": 1},
+        "snapshot_id": {"type": "string", "minLength": 1},
+        "base_commit_sha": {"type": "string", "minLength": 1},
+        "applied_commit_sha": {"type": "string"},
+        "file_count": {"type": "integer", "minimum": 1},
+        "principal_id": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}
