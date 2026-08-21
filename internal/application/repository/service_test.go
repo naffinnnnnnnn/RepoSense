@@ -123,3 +123,47 @@ func TestServiceRejectsUnsafeIncludePattern(t *testing.T) {
 		t.Fatalf("预期错误码为 INVALID_INPUT，实际为：%v", err)
 	}
 }
+
+// TestServiceDoesNotReuseMutableRefResultAfterRefMoves 验证 CLI 风格幂等键不会把移动后的 ref 映射到旧 commit。
+func TestServiceDoesNotReuseMutableRefResultAfterRefMoves(t *testing.T) {
+	sha1 := "1111111111111111111111111111111111111111"
+	sha2 := "2222222222222222222222222222222222222222"
+	git := &fakeGit{
+		commits: map[string]string{"main": sha1},
+		files: map[string]map[string][]byte{
+			sha1: {"a.py": []byte("def first():\n    return 1\n")},
+			sha2: {"a.py": []byte("def second():\n    return 2\n")},
+		},
+		diffs: map[string][]repository.ChangedPath{
+			sha1 + ":" + sha2: {{Path: "a.py", Kind: repository.ChangeModified}},
+		},
+	}
+	service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), memory.NewRepositoryStore(), nil, nil, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := repository.SyncCommand{
+		Scope:          common.Scope{TenantID: "tenant", RepositoryID: "repo"},
+		RepositoryPath: "ignored",
+		Ref:            "main",
+		IdempotencyKey: "repo:main",
+	}
+	first, err := service.Sync(context.Background(), cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Snapshot.CommitSHA != sha1 {
+		t.Fatalf("首次解析 commit 不符合预期：%s", first.Snapshot.CommitSHA)
+	}
+
+	// 模拟 main 从 sha1 前进到 sha2；命令文本和 CLI 自动生成的幂等键保持不变。
+	git.commits["main"] = sha2
+	second, err := service.Sync(context.Background(), cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 工程预期不能静默返回 sha1 的缓存结果，至少应解析到 sha2 或报告幂等冲突。
+	if second.Snapshot.CommitSHA != sha2 {
+		t.Fatalf("ref 已移动到 %s，但幂等结果仍指向旧 commit %s", sha2, second.Snapshot.CommitSHA)
+	}
+}
