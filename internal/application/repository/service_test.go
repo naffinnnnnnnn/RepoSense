@@ -2,8 +2,11 @@ package repositoryapp_test
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
 	"testing"
 	"time"
 
@@ -57,6 +60,26 @@ func (s *sequenceIDs) New(prefix string) string {
 type fixedClock struct{}
 
 func (fixedClock) Now() time.Time { return time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC) }
+
+// recordingPublisher 为构造测试提供一个显式、可工作的事件发布依赖。
+type recordingPublisher struct{}
+
+func (recordingPublisher) Publish(context.Context, common.EventEnvelope) error { return nil }
+
+// recordingObserver 为构造测试提供一个显式、可工作的可观测依赖。
+type recordingObserver struct{}
+
+func (recordingObserver) Stage(context.Context, string, map[string]string) func(error) {
+	return func(error) {}
+}
+func (recordingObserver) Count(string, int64, map[string]string) {}
+
+// failingEntropyReader 模拟操作系统安全随机源不可用。
+type failingEntropyReader struct{}
+
+func (failingEntropyReader) Read([]byte) (int, error) {
+	return 0, errors.New("安全随机源不可用")
+}
 
 func TestServiceFullIncrementalAndIdempotent(t *testing.T) {
 	sha1, sha2 := "1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222"
@@ -165,5 +188,59 @@ func TestServiceDoesNotReuseMutableRefResultAfterRefMoves(t *testing.T) {
 	// 工程预期不能静默返回 sha1 的缓存结果，至少应解析到 sha2 或报告幂等冲突。
 	if second.Snapshot.CommitSHA != sha2 {
 		t.Fatalf("ref 已移动到 %s，但幂等结果仍指向旧 commit %s", sha2, second.Snapshot.CommitSHA)
+	}
+}
+
+// TestNewRejectsMissingOperationalDependencies 验证事件发布和可观测依赖缺失时构造函数会明确失败。
+func TestNewRejectsMissingOperationalDependencies(t *testing.T) {
+	t.Run("missing_event_publisher", func(t *testing.T) {
+		_, err := repositoryapp.New(&fakeGit{}, parseradapter.DefaultRegistry(), memory.NewRepositoryStore(), nil, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+		if err == nil {
+			t.Fatal("缺少 EventPublisher 时不应静默使用 noopPublisher")
+		}
+	})
+	t.Run("missing_observer", func(t *testing.T) {
+		_, err := repositoryapp.New(&fakeGit{}, parseradapter.DefaultRegistry(), memory.NewRepositoryStore(), recordingPublisher{}, nil, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+		if err == nil {
+			t.Fatal("缺少 Observer 时不应静默使用 noopObserver")
+		}
+	})
+}
+
+// TestRandomIDsDoesNotPanicWhenEntropyIsUnavailable 验证安全随机源异常不会直接终止 worker 进程。
+func TestRandomIDsDoesNotPanicWhenEntropyIsUnavailable(t *testing.T) {
+	const childMarker = "REPOSENSE_FAIL_ENTROPY_CHILD"
+	if os.Getenv(childMarker) == "1" {
+		// crypto/rand 的 fatal error 无法由 recover 捕获，必须放在子进程中注入。
+		cryptorand.Reader = failingEntropyReader{}
+		_ = (repositoryapp.RandomIDs{}).New("snap")
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRandomIDsDoesNotPanicWhenEntropyIsUnavailable$")
+	cmd.Env = append(os.Environ(), childMarker+"=1")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("安全随机源不可用时不应终止 worker 进程：%v：%s", err, output)
+	}
+}
+
+// TestNewRejectsNonPositiveResourceLimits 验证零值和负数资源上限不会被静默替换成默认配置。
+func TestNewRejectsNonPositiveResourceLimits(t *testing.T) {
+	tests := []struct {
+		name   string
+		config repositoryapp.Config
+	}{
+		{name: "zero_max_files", config: repositoryapp.Config{MaxFiles: 0, MaxFileBytes: 1024}},
+		{name: "negative_max_files", config: repositoryapp.Config{MaxFiles: -1, MaxFileBytes: 1024}},
+		{name: "zero_max_file_bytes", config: repositoryapp.Config{MaxFiles: 1, MaxFileBytes: 0}},
+		{name: "negative_max_file_bytes", config: repositoryapp.Config{MaxFiles: 1, MaxFileBytes: -1}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := repositoryapp.New(&fakeGit{}, parseradapter.DefaultRegistry(), memory.NewRepositoryStore(), recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, tt.config)
+			if err == nil {
+				t.Fatalf("非正数资源上限应返回配置错误，实际配置为：%#v", tt.config)
+			}
+		})
 	}
 }
