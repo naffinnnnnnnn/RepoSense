@@ -177,6 +177,136 @@ func (s *coordinatedMissStore) Artifacts(ctx context.Context, scope common.Scope
 	return s.delegate.Artifacts(ctx, scope, cursor, limit)
 }
 
+// observingBaselineStore 记录每次请求实际读取到的增量基线。
+// 测试通过在 Git Diff 阶段暂停第一个请求，观察第二个请求能否越过仓库级串行边界。
+type observingBaselineStore struct {
+	delegate *memory.RepositoryStore
+	observed chan string
+}
+
+func newObservingBaselineStore() *observingBaselineStore {
+	return &observingBaselineStore{delegate: memory.NewRepositoryStore(), observed: make(chan string, 2)}
+}
+
+func (s *observingBaselineStore) FindByIdempotencyKey(ctx context.Context, scope common.Scope, key string) (repository.ParseResult, bool, error) {
+	return s.delegate.FindByIdempotencyKey(ctx, scope, key)
+}
+func (s *observingBaselineStore) LatestSnapshot(ctx context.Context, scope common.Scope) (repository.Snapshot, bool, error) {
+	baseline, ok, err := s.delegate.LatestSnapshot(ctx, scope)
+	if err == nil && ok {
+		s.observed <- baseline.SnapshotID
+	}
+	return baseline, ok, nil
+}
+func (s *observingBaselineStore) SaveResult(ctx context.Context, key string, result repository.ParseResult) error {
+	return s.delegate.SaveResult(ctx, key, result)
+}
+func (s *observingBaselineStore) GetSnapshot(ctx context.Context, scope common.Scope) (repository.Snapshot, error) {
+	return s.delegate.GetSnapshot(ctx, scope)
+}
+func (s *observingBaselineStore) Artifacts(ctx context.Context, scope common.Scope, cursor string, limit int) ([]repository.CodeArtifact, string, error) {
+	return s.delegate.Artifacts(ctx, scope, cursor, limit)
+}
+
+// blockingFirstDiffGit 将第一个请求暂停在耗时的 Diff 阶段，第二个请求仍可尝试读取基线。
+type blockingFirstDiffGit struct {
+	mu           sync.Mutex
+	diffCalls    int
+	firstEntered chan struct{}
+	releaseFirst chan struct{}
+}
+
+func newBlockingFirstDiffGit() *blockingFirstDiffGit {
+	return &blockingFirstDiffGit{firstEntered: make(chan struct{}), releaseFirst: make(chan struct{})}
+}
+func (*blockingFirstDiffGit) ResolveCommit(_ context.Context, _ string, ref string) (string, error) {
+	switch ref {
+	case "commit-a":
+		return "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", nil
+	case "commit-b":
+		return "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", nil
+	default:
+		return "", errors.New("ref 不存在")
+	}
+}
+func (*blockingFirstDiffGit) ListFiles(context.Context, string, string) ([]string, error) {
+	return []string{}, nil
+}
+func (g *blockingFirstDiffGit) Diff(ctx context.Context, _ string, _, _ string) ([]repository.ChangedPath, error) {
+	g.mu.Lock()
+	g.diffCalls++
+	call := g.diffCalls
+	if call == 1 {
+		close(g.firstEntered)
+	}
+	g.mu.Unlock()
+	if call == 1 {
+		select {
+		case <-g.releaseFirst:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return []repository.ChangedPath{}, nil
+}
+func (*blockingFirstDiffGit) ReadFile(context.Context, string, string, string) ([]byte, error) {
+	return nil, nil
+}
+
+// identityCheckingGit 为两个不同仓库返回互不相容的 commit，并记录错误的跨仓库 Diff。
+type identityCheckingGit struct {
+	mu        sync.Mutex
+	diffCalls int
+}
+
+func (*identityCheckingGit) ResolveCommit(_ context.Context, repositoryPath, _ string) (string, error) {
+	switch repositoryPath {
+	case "repo-a":
+		return "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", nil
+	case "repo-b":
+		return "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", nil
+	default:
+		return "", errors.New("仓库不存在")
+	}
+}
+func (*identityCheckingGit) ListFiles(context.Context, string, string) ([]string, error) {
+	return []string{}, nil
+}
+func (g *identityCheckingGit) Diff(context.Context, string, string, string) ([]repository.ChangedPath, error) {
+	g.mu.Lock()
+	g.diffCalls++
+	g.mu.Unlock()
+	return nil, errors.New("增量基线不属于当前仓库")
+}
+func (*identityCheckingGit) ReadFile(context.Context, string, string, string) ([]byte, error) {
+	return nil, nil
+}
+func (g *identityCheckingGit) DiffCalls() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.diffCalls
+}
+
+// missingBaselineGit 模拟强制推送后旧 commit 已从远端历史和本地对象库中消失。
+type missingBaselineGit struct {
+	commit string
+	listed int
+}
+
+func (g *missingBaselineGit) ResolveCommit(context.Context, string, string) (string, error) {
+	return g.commit, nil
+}
+func (g *missingBaselineGit) ListFiles(context.Context, string, string) ([]string, error) {
+	g.listed++
+	return []string{"new.py"}, nil
+}
+func (*missingBaselineGit) Diff(context.Context, string, string, string) ([]repository.ChangedPath, error) {
+	return nil, &repository.DomainError{Code: repository.ErrRefNotFound, Operation: "diff_base", Message: "增量基线 commit 不存在"}
+}
+func (*missingBaselineGit) ReadFile(context.Context, string, string, string) ([]byte, error) {
+	return []byte("def current(): pass"), nil
+}
+
 func TestServiceFullIncrementalAndIdempotent(t *testing.T) {
 	sha1, sha2 := "1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222"
 	git := &fakeGit{commits: map[string]string{"v1": sha1, "v2": sha2}, files: map[string]map[string][]byte{
@@ -382,6 +512,135 @@ func TestServiceClassifiesIdempotencyLookupErrors(t *testing.T) {
 			t.Fatalf("存储错误元数据不完整：%#v", domainErr)
 		}
 	})
+}
+
+// TestServiceRejectsRepositoryPathReuseForSameRepositoryID 验证 RepositoryID 与物理仓库身份一一对应。
+// 如果调用方把同一个 RepositoryID 指向另一条路径，服务必须在构造跨仓库 Diff 前明确拒绝。
+func TestServiceRejectsRepositoryPathReuseForSameRepositoryID(t *testing.T) {
+	git := &identityCheckingGit{}
+	service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), memory.NewRepositoryStore(), recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := common.Scope{TenantID: "tenant", RepositoryID: "shared-repo-id", TraceID: "trace"}
+	if _, err := service.Sync(context.Background(), repository.SyncCommand{
+		Scope: scope, RepositoryPath: "repo-a", Ref: "main", IdempotencyKey: "repo-a-first",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, secondErr := service.Sync(context.Background(), repository.SyncCommand{
+		Scope: scope, RepositoryPath: "repo-b", Ref: "main", IdempotencyKey: "repo-b-second",
+	})
+	var domainErr *repository.DomainError
+	if !errors.As(secondErr, &domainErr) || domainErr.Code != repository.ErrInvalidInput || domainErr.Operation != "repository_identity" || domainErr.Retryable {
+		t.Fatalf("RepositoryID 复用到不同路径时应返回不可重试的仓库身份冲突：%v", secondErr)
+	}
+	if calls := git.DiffCalls(); calls != 0 {
+		t.Fatalf("仓库身份校验应发生在 Diff 前，跨仓库 Diff 调用次数=%d", calls)
+	}
+}
+
+// TestConcurrentIncrementalSyncsFormLinearSnapshotChain 验证同一仓库的增量同步必须串行决定基线。
+// 第一个请求停在 Diff 时启动第二个请求，可以直接检验耗时区间是否仍受仓库级并发控制。
+func TestConcurrentIncrementalSyncsFormLinearSnapshotChain(t *testing.T) {
+	store := newObservingBaselineStore()
+	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}
+	base := repository.ParseResult{Snapshot: repository.Snapshot{
+		EntityMeta: repository.NewMeta("snapshot-0", scope, repository.StatusSucceeded, fixedClock{}.Now()),
+		SnapshotID: "snapshot-0", CommitSHA: "0000000000000000000000000000000000000000", SyncStatus: repository.StatusSucceeded,
+	}}
+	if err := store.delegate.SaveResult(context.Background(), "base", base); err != nil {
+		t.Fatal(err)
+	}
+	git := newBlockingFirstDiffGit()
+	service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), store, recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	type outcome struct {
+		result repository.ParseResult
+		err    error
+	}
+	outcomes := make(chan outcome, 2)
+	run := func(ref, key string) {
+		result, syncErr := service.Sync(context.Background(), repository.SyncCommand{
+			Scope: scope, RepositoryPath: "repo", Ref: ref, IdempotencyKey: key,
+		})
+		outcomes <- outcome{result: result, err: syncErr}
+	}
+	go run("commit-a", "sync-a")
+
+	// 确认第一个请求已经读取 S0 并进入无锁风险最大的 Diff 阶段。
+	select {
+	case baseline := <-store.observed:
+		if baseline != "snapshot-0" {
+			t.Fatalf("首个增量请求基线异常：%s", baseline)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("首个请求未读取增量基线")
+	}
+	select {
+	case <-git.firstEntered:
+	case <-time.After(time.Second):
+		t.Fatal("首个请求未进入 Diff")
+	}
+
+	go run("commit-b", "sync-b")
+	// 给第二个请求机会越过无锁区间；随后无论是否已经读到基线，都释放第一个请求，避免测试死锁。
+	select {
+	case <-store.observed:
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(git.releaseFirst)
+
+	results := make([]repository.ParseResult, 0, 2)
+	for range 2 {
+		select {
+		case got := <-outcomes:
+			if got.err != nil {
+				t.Fatalf("并发增量同步不应失败：%v", got.err)
+			}
+			results = append(results, got.result)
+		case <-time.After(2 * time.Second):
+			t.Fatal("并发增量同步未结束")
+		}
+	}
+	// 线性历史必须是 S0 -> S1 -> S2；两个结果都以 S0 为父节点说明发生了分叉。
+	linear := (results[0].Snapshot.ParentSnapshotID == "snapshot-0" && results[1].Snapshot.ParentSnapshotID == results[0].Snapshot.SnapshotID) ||
+		(results[1].Snapshot.ParentSnapshotID == "snapshot-0" && results[0].Snapshot.ParentSnapshotID == results[1].Snapshot.SnapshotID)
+	if !linear {
+		t.Fatalf("并发同步产生了分叉快照：first=%s<- %s second=%s<- %s",
+			results[0].Snapshot.SnapshotID, results[0].Snapshot.ParentSnapshotID,
+			results[1].Snapshot.SnapshotID, results[1].Snapshot.ParentSnapshotID)
+	}
+}
+
+// TestServiceFallsBackToFullSyncWhenPreviousCommitDisappears 验证强制推送或对象清理后，
+// 旧基线 commit 不可达时不会永久阻断同步，而是安全降级为当前 commit 的全量解析。
+func TestServiceFallsBackToFullSyncWhenPreviousCommitDisappears(t *testing.T) {
+	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}
+	store := memory.NewRepositoryStore()
+	base := repository.ParseResult{Snapshot: repository.Snapshot{
+		EntityMeta: repository.NewMeta("old-snapshot", scope, repository.StatusSucceeded, fixedClock{}.Now()),
+		SnapshotID: "old-snapshot", CommitSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", SyncStatus: repository.StatusSucceeded,
+	}}
+	if err := store.SaveResult(context.Background(), "old", base); err != nil {
+		t.Fatal(err)
+	}
+	git := &missingBaselineGit{commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+	service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), store, recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, syncErr := service.Sync(context.Background(), repository.SyncCommand{
+		Scope: scope, RepositoryPath: "repo", Ref: "main", IdempotencyKey: "after-force-push",
+	})
+	if syncErr != nil {
+		t.Fatalf("旧基线消失后应降级为全量同步，而不是直接失败：%v", syncErr)
+	}
+	if result.Job.Scope != repository.ScopeFull || result.Snapshot.ParentSnapshotID != "" || git.listed != 1 {
+		t.Fatalf("强推降级结果不完整：scope=%s parent=%q list_calls=%d", result.Job.Scope, result.Snapshot.ParentSnapshotID, git.listed)
+	}
 }
 
 func TestServicePersistsSanitizedFailure(t *testing.T) {
