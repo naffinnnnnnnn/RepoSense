@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,16 +23,24 @@ type fakeGit struct {
 	files    map[string]map[string][]byte
 	diffs    map[string][]repository.ChangedPath
 	readErr  error
+	mu       sync.Mutex
 	resolves int
 }
 
 func (f *fakeGit) ResolveCommit(_ context.Context, _ string, ref string) (string, error) {
+	f.mu.Lock()
 	f.resolves++
+	f.mu.Unlock()
 	value, ok := f.commits[ref]
 	if !ok {
 		return "", errors.New("ref 不存在")
 	}
 	return value, nil
+}
+func (f *fakeGit) ResolveCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.resolves
 }
 func (f *fakeGit) ListFiles(_ context.Context, _ string, commit string) ([]string, error) {
 	var out []string
@@ -50,9 +59,14 @@ func (f *fakeGit) ReadFile(_ context.Context, _ string, commit, path string) ([]
 	return f.files[commit][path], nil
 }
 
-type sequenceIDs struct{ value int }
+type sequenceIDs struct {
+	mu    sync.Mutex
+	value int
+}
 
 func (s *sequenceIDs) New(prefix string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.value++
 	return fmt.Sprintf("%s_%d", prefix, s.value)
 }
@@ -65,6 +79,25 @@ func (fixedClock) Now() time.Time { return time.Date(2026, 8, 10, 0, 0, 0, 0, ti
 type recordingPublisher struct{}
 
 func (recordingPublisher) Publish(context.Context, common.EventEnvelope) error { return nil }
+
+// collectingPublisher 保存发布记录，用于验证幂等命中不会重复产生外部副作用。
+type collectingPublisher struct {
+	mu     sync.Mutex
+	events []common.EventEnvelope
+}
+
+func (p *collectingPublisher) Publish(_ context.Context, event common.EventEnvelope) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.events = append(p.events, event)
+	return nil
+}
+
+func (p *collectingPublisher) Events() []common.EventEnvelope {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]common.EventEnvelope(nil), p.events...)
+}
 
 // recordingObserver 为构造测试提供一个显式、可工作的可观测依赖。
 type recordingObserver struct{}
@@ -79,6 +112,69 @@ type failingEntropyReader struct{}
 
 func (failingEntropyReader) Read([]byte) (int, error) {
 	return 0, errors.New("安全随机源不可用")
+}
+
+// lookupErrorStore 在幂等查询阶段返回指定错误，其他方法均不应被调用。
+type lookupErrorStore struct{ err error }
+
+func (s lookupErrorStore) FindByIdempotencyKey(context.Context, common.Scope, string) (repository.ParseResult, bool, error) {
+	return repository.ParseResult{}, false, s.err
+}
+func (lookupErrorStore) LatestSnapshot(context.Context, common.Scope) (repository.Snapshot, bool, error) {
+	panic("幂等查询失败后不应加载增量基线")
+}
+func (lookupErrorStore) SaveResult(context.Context, string, repository.ParseResult) error {
+	panic("幂等查询失败后不应保存结果")
+}
+func (lookupErrorStore) GetSnapshot(context.Context, common.Scope) (repository.Snapshot, error) {
+	panic("幂等查询失败后不应读取快照")
+}
+func (lookupErrorStore) Artifacts(context.Context, common.Scope, string, int) ([]repository.CodeArtifact, string, error) {
+	panic("幂等查询失败后不应读取制品")
+}
+
+// coordinatedMissStore 强制两个并发请求都在首轮幂等查询中得到 miss，
+// 用于稳定复现“查询与保存不是一个原子操作”的竞态窗口。
+type coordinatedMissStore struct {
+	delegate *memory.RepositoryStore
+	mu       sync.Mutex
+	lookups  int
+	ready    chan struct{}
+}
+
+func newCoordinatedMissStore() *coordinatedMissStore {
+	return &coordinatedMissStore{delegate: memory.NewRepositoryStore(), ready: make(chan struct{})}
+}
+
+func (s *coordinatedMissStore) FindByIdempotencyKey(ctx context.Context, scope common.Scope, key string) (repository.ParseResult, bool, error) {
+	s.mu.Lock()
+	s.lookups++
+	lookup := s.lookups
+	if lookup == 2 {
+		close(s.ready)
+	}
+	s.mu.Unlock()
+	if lookup <= 2 {
+		select {
+		case <-s.ready:
+			return repository.ParseResult{}, false, nil
+		case <-ctx.Done():
+			return repository.ParseResult{}, false, ctx.Err()
+		}
+	}
+	return s.delegate.FindByIdempotencyKey(ctx, scope, key)
+}
+func (s *coordinatedMissStore) LatestSnapshot(ctx context.Context, scope common.Scope) (repository.Snapshot, bool, error) {
+	return s.delegate.LatestSnapshot(ctx, scope)
+}
+func (s *coordinatedMissStore) SaveResult(ctx context.Context, key string, result repository.ParseResult) error {
+	return s.delegate.SaveResult(ctx, key, result)
+}
+func (s *coordinatedMissStore) GetSnapshot(ctx context.Context, scope common.Scope) (repository.Snapshot, error) {
+	return s.delegate.GetSnapshot(ctx, scope)
+}
+func (s *coordinatedMissStore) Artifacts(ctx context.Context, scope common.Scope, cursor string, limit int) ([]repository.CodeArtifact, string, error) {
+	return s.delegate.Artifacts(ctx, scope, cursor, limit)
 }
 
 func TestServiceFullIncrementalAndIdempotent(t *testing.T) {
@@ -119,6 +215,173 @@ func TestServiceFullIncrementalAndIdempotent(t *testing.T) {
 	if cached.Snapshot.SnapshotID != second.Snapshot.SnapshotID || git.resolves != resolves {
 		t.Fatal("幂等请求不应重复执行解析工作")
 	}
+}
+
+// TestServiceBindsIdempotencyKeyToCommand 验证幂等键只能重放同一业务命令，
+// 不能在 Ref 或 IncludePaths 已变化时静默返回旧结果。
+func TestServiceBindsIdempotencyKeyToCommand(t *testing.T) {
+	sha1 := "1111111111111111111111111111111111111111"
+	sha2 := "2222222222222222222222222222222222222222"
+	tests := []struct {
+		name       string
+		firstRef   string
+		secondRef  string
+		firstPaths []string
+		secondPath []string
+		wantCommit string
+		wantPath   string
+	}{
+		{name: "different_ref", firstRef: "v1", secondRef: "v2", wantCommit: sha2},
+		{name: "different_include_paths", firstRef: "v1", secondRef: "v1", firstPaths: []string{"src/**"}, secondPath: []string{"docs/**"}, wantCommit: sha1, wantPath: "docs/readme.md"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			git := &fakeGit{
+				commits: map[string]string{"v1": sha1, "v2": sha2},
+				files: map[string]map[string][]byte{
+					sha1: {"src/a.py": []byte("def a(): pass"), "docs/readme.md": []byte("docs")},
+					sha2: {"src/b.py": []byte("def b(): pass")},
+				},
+			}
+			service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), memory.NewRepositoryStore(), recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}
+			firstCommand := repository.SyncCommand{Scope: scope, RepositoryPath: "repo", Ref: tt.firstRef, IncludePaths: tt.firstPaths, IdempotencyKey: "shared-key"}
+			if _, err := service.Sync(context.Background(), firstCommand); err != nil {
+				t.Fatal(err)
+			}
+			secondCommand := repository.SyncCommand{Scope: scope, RepositoryPath: "repo", Ref: tt.secondRef, IncludePaths: tt.secondPath, IdempotencyKey: "shared-key"}
+			second, secondErr := service.Sync(context.Background(), secondCommand)
+			// 合法策略可以是按新命令执行，也可以明确报告幂等冲突；唯一禁止的是静默返回旧结果。
+			if secondErr != nil {
+				var conflict *repository.DomainError
+				if !errors.As(secondErr, &conflict) || conflict.Operation != "idempotency_conflict" || conflict.Retryable {
+					t.Fatalf("同一幂等键绑定不同命令时应返回明确、不可重试的幂等冲突：%v", secondErr)
+				}
+				return
+			}
+			if second.Snapshot.CommitSHA != tt.wantCommit {
+				t.Fatalf("幂等键复用了不同 Ref 的旧结果：got commit=%s want=%s", second.Snapshot.CommitSHA, tt.wantCommit)
+			}
+			if tt.wantPath != "" && (len(second.Snapshot.ChangedPaths) != 1 || second.Snapshot.ChangedPaths[0].Path != tt.wantPath) {
+				t.Fatalf("幂等键复用了不同 IncludePaths 的旧结果：%#v", second.Snapshot.ChangedPaths)
+			}
+		})
+	}
+}
+
+// TestConcurrentRequestsWithSameIdempotencyKeyExecuteOnce 验证“查询未命中到保存结果”
+// 必须具备原子占位或等价的单飞机制，两个并发请求不能同时执行解析。
+func TestConcurrentRequestsWithSameIdempotencyKeyExecuteOnce(t *testing.T) {
+	sha := "1111111111111111111111111111111111111111"
+	git := &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {"a.py": []byte("def a(): pass")}}}
+	store := newCoordinatedMissStore()
+	service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), store, recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := repository.SyncCommand{
+		Scope:          common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"},
+		RepositoryPath: "repo",
+		Ref:            "main",
+		IdempotencyKey: "concurrent-key",
+	}
+	errorsCh := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, syncErr := service.Sync(context.Background(), cmd)
+			errorsCh <- syncErr
+		}()
+	}
+	for range 2 {
+		if syncErr := <-errorsCh; syncErr != nil {
+			t.Fatalf("并发幂等请求不应失败：%v", syncErr)
+		}
+	}
+	if got := git.ResolveCount(); got != 1 {
+		t.Fatalf("相同幂等键的并发请求应只执行一次 Git 解析，ResolveCommit 调用次数=%d", got)
+	}
+}
+
+// TestIdempotencyHitDoesNotRepublishCompletedEvent 验证缓存命中只返回已保存结果，
+// 不会把同一个 EventID 的完成事件再次发布给外部消费者。
+func TestIdempotencyHitDoesNotRepublishCompletedEvent(t *testing.T) {
+	sha := "1111111111111111111111111111111111111111"
+	git := &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {"a.py": []byte("def a(): pass")}}}
+	publisher := &collectingPublisher{}
+	service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), memory.NewRepositoryStore(), publisher, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := repository.SyncCommand{
+		Scope:          common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"},
+		RepositoryPath: "repo",
+		Ref:            "main",
+		IdempotencyKey: "event-key",
+	}
+	first, err := service.Sync(context.Background(), cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.Sync(context.Background(), cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Snapshot.SnapshotID != second.Snapshot.SnapshotID {
+		t.Fatal("幂等命中应返回同一个已保存结果")
+	}
+	events := publisher.Events()
+	if len(events) != 1 {
+		ids := make([]string, 0, len(events))
+		for _, event := range events {
+			ids = append(ids, event.EventID)
+		}
+		t.Fatalf("幂等命中不应重复发布完成事件：publish count=%d event IDs=%v", len(events), ids)
+	}
+}
+
+// TestServiceClassifiesIdempotencyLookupErrors 验证调用取消/超时不会被误报为存储故障，
+// 同时真实的存储错误仍保留 PERSISTENCE_FAILURE、操作阶段和原始 cause。
+func TestServiceClassifiesIdempotencyLookupErrors(t *testing.T) {
+	command := repository.SyncCommand{
+		Scope:          common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"},
+		RepositoryPath: "repo",
+		Ref:            "main",
+		IdempotencyKey: "lookup-error",
+	}
+	for _, contextErr := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(contextErr.Error(), func(t *testing.T) {
+			service, err := repositoryapp.New(&fakeGit{}, parseradapter.DefaultRegistry(), lookupErrorStore{err: contextErr}, recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, syncErr := service.Sync(context.Background(), command)
+			if !errors.Is(syncErr, contextErr) {
+				t.Fatalf("应保留上下文错误，got=%v want=%v", syncErr, contextErr)
+			}
+			if repository.IsCode(syncErr, repository.ErrPersistence) {
+				t.Fatalf("上下文错误不应被分类为 PERSISTENCE_FAILURE：%v", syncErr)
+			}
+		})
+	}
+
+	t.Run("storage_failure", func(t *testing.T) {
+		cause := errors.New("database unavailable")
+		service, err := repositoryapp.New(&fakeGit{}, parseradapter.DefaultRegistry(), lookupErrorStore{err: cause}, recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, syncErr := service.Sync(context.Background(), command)
+		if !repository.IsCode(syncErr, repository.ErrPersistence) || !errors.Is(syncErr, cause) {
+			t.Fatalf("真实存储错误应保留分类及 cause：%v", syncErr)
+		}
+		var domainErr *repository.DomainError
+		if !errors.As(syncErr, &domainErr) || domainErr.Operation != "idempotency_lookup" || !domainErr.Retryable {
+			t.Fatalf("存储错误元数据不完整：%#v", domainErr)
+		}
+	})
 }
 
 func TestServicePersistsSanitizedFailure(t *testing.T) {
