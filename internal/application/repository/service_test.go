@@ -3,10 +3,12 @@ package repositoryapp_test
 import (
 	"context"
 	cryptorand "crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"sync"
 	"testing"
@@ -97,6 +99,32 @@ type collectingPublisher struct {
 	events []common.EventEnvelope
 }
 
+// flakyPublisher 模拟事件 Broker 首次不可用、后续恢复，并区分发布尝试和成功投递。
+type flakyPublisher struct {
+	mu        sync.Mutex
+	failures  int
+	attempts  []common.EventEnvelope
+	delivered []common.EventEnvelope
+}
+
+func (p *flakyPublisher) Publish(_ context.Context, event common.EventEnvelope) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.attempts = append(p.attempts, event)
+	if p.failures > 0 {
+		p.failures--
+		return errors.New("事件 Broker 暂时不可用")
+	}
+	p.delivered = append(p.delivered, event)
+	return nil
+}
+
+func (p *flakyPublisher) Counts() (attempts, delivered int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.attempts), len(p.delivered)
+}
+
 func (p *collectingPublisher) Publish(_ context.Context, event common.EventEnvelope) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -142,6 +170,28 @@ func (lookupErrorStore) GetSnapshot(context.Context, common.Scope) (repository.S
 }
 func (lookupErrorStore) Artifacts(context.Context, common.Scope, string, int) ([]repository.CodeArtifact, string, error) {
 	panic("幂等查询失败后不应读取制品")
+}
+
+// saveErrorStore 只在最终 SaveResult 阶段失败，用来确认已经完成的解析结果不会被清空。
+type saveErrorStore struct {
+	delegate *memory.RepositoryStore
+	err      error
+}
+
+func (s saveErrorStore) FindByIdempotencyKey(ctx context.Context, scope common.Scope, key string) (repository.ParseResult, bool, error) {
+	return s.delegate.FindByIdempotencyKey(ctx, scope, key)
+}
+func (s saveErrorStore) LatestSnapshot(ctx context.Context, scope common.Scope) (repository.Snapshot, bool, error) {
+	return s.delegate.LatestSnapshot(ctx, scope)
+}
+func (s saveErrorStore) SaveResult(context.Context, string, repository.ParseResult) error {
+	return s.err
+}
+func (s saveErrorStore) GetSnapshot(ctx context.Context, scope common.Scope) (repository.Snapshot, error) {
+	return s.delegate.GetSnapshot(ctx, scope)
+}
+func (s saveErrorStore) Artifacts(ctx context.Context, scope common.Scope, cursor string, limit int) ([]repository.CodeArtifact, string, error) {
+	return s.delegate.Artifacts(ctx, scope, cursor, limit)
 }
 
 // coordinatedMissStore 强制两个并发请求都在首轮幂等查询中得到 miss，
@@ -363,6 +413,21 @@ func (*cancelingReadGit) Diff(context.Context, string, string, string) ([]reposi
 func (g *cancelingReadGit) ReadFile(context.Context, string, string, string) ([]byte, error) {
 	g.cancel()
 	return nil, g.cause
+}
+
+// steppingClock 每次调用向前推进固定步长，用于验证 CreatedAt、UpdatedAt 和 OccurredAt 的顺序。
+type steppingClock struct {
+	mu   sync.Mutex
+	now  time.Time
+	step time.Duration
+}
+
+func (c *steppingClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	value := c.now
+	c.now = c.now.Add(c.step)
+	return value
 }
 
 func TestServiceFullIncrementalAndIdempotent(t *testing.T) {
@@ -1062,6 +1127,174 @@ func TestServicePersistsOriginalFailureAfterContextCancellation(t *testing.T) {
 	}
 }
 
+// TestFailureProgressIncludesAlreadyInspectedChanges 验证失败进度按已经完成检查的变更计算。
+// 即使前一个文件因 unsupported 被跳过，它也已经处理完成，第二个文件失败时进度应为 50%。
+func TestFailureProgressIncludesAlreadyInspectedChanges(t *testing.T) {
+	baseSHA := "0000000000000000000000000000000000000000"
+	currentSHA := "1111111111111111111111111111111111111111"
+	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}
+	store := memory.NewRepositoryStore()
+	base := repository.ParseResult{Snapshot: repository.Snapshot{
+		EntityMeta: repository.NewMeta("base", scope, repository.StatusSucceeded, fixedClock{}.Now()),
+		SnapshotID: "base", CommitSHA: baseSHA, SyncStatus: repository.StatusSucceeded,
+	}}
+	if err := store.SaveResult(context.Background(), "base", base); err != nil {
+		t.Fatal(err)
+	}
+	git := &fakeGit{
+		commits: map[string]string{"main": currentSHA},
+		files:   map[string]map[string][]byte{currentSHA: {"b.py": []byte("def b(): pass")}},
+		diffs: map[string][]repository.ChangedPath{baseSHA + ":" + currentSHA: {
+			{Path: "a.unsupported", Kind: repository.ChangeAdded},
+			{Path: "b.py", Kind: repository.ChangeModified},
+		}},
+		readErr: errors.New("读取第二个文件失败"),
+	}
+	service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), store, recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, syncErr := service.Sync(context.Background(), repository.SyncCommand{
+		Scope: scope, RepositoryPath: "repo", Ref: "main", IdempotencyKey: "partial-progress",
+	})
+	if !repository.IsCode(syncErr, repository.ErrGitFailure) {
+		t.Fatalf("预期第二个文件读取失败：%v", syncErr)
+	}
+	if result.Job.Progress != 50 {
+		t.Fatalf("失败进度未包含已经检查的跳过文件：got=%d want=50", result.Job.Progress)
+	}
+}
+
+// TestCompletedParseResultSurvivesSaveFailure 验证解析已经成功收口后，即使持久化失败，
+// 调用方仍能拿到带 Snapshot、Job 和完成事件的 ParseResult，而不是无法诊断的零值。
+func TestCompletedParseResultSurvivesSaveFailure(t *testing.T) {
+	sha := "1111111111111111111111111111111111111111"
+	cause := errors.New("数据库写入失败")
+	git := &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {}}}
+	store := saveErrorStore{delegate: memory.NewRepositoryStore(), err: cause}
+	service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), store, recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, syncErr := service.Sync(context.Background(), repository.SyncCommand{
+		Scope: common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}, RepositoryPath: "repo", Ref: "main", IdempotencyKey: "save-failure",
+	})
+	if !repository.IsCode(syncErr, repository.ErrPersistence) || !errors.Is(syncErr, cause) {
+		t.Fatalf("保存失败分类错误：%v", syncErr)
+	}
+	if result.Snapshot.SnapshotID == "" || result.Snapshot.CommitSHA != sha || result.Job.Status != repository.StatusSucceeded || result.Event.EventType != "parse.completed.v1" {
+		t.Fatalf("保存失败不应清空已经完成的 ParseResult：%#v", result)
+	}
+}
+
+// TestPublishFailureCanBeRecoveredByIdempotentRetry 验证先保存后发布的当前恢复语义：
+// 首次 Broker 失败保留成功 ParseResult，使用同一幂等键重试后只补发事件，不重复解析 Git。
+func TestPublishFailureCanBeRecoveredByIdempotentRetry(t *testing.T) {
+	sha := "1111111111111111111111111111111111111111"
+	git := &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {}}}
+	publisher := &flakyPublisher{failures: 1}
+	service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), memory.NewRepositoryStore(), publisher, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := repository.SyncCommand{
+		Scope: common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}, RepositoryPath: "repo", Ref: "main", IdempotencyKey: "publish-retry",
+	}
+	first, firstErr := service.Sync(context.Background(), cmd)
+	if !repository.IsCode(firstErr, repository.ErrPersistence) || first.Job.Status != repository.StatusSucceeded {
+		t.Fatalf("首次发布失败应保留成功解析结果：result=%#v err=%v", first, firstErr)
+	}
+	resolveCalls := git.ResolveCount()
+	second, secondErr := service.Sync(context.Background(), cmd)
+	if secondErr != nil || second.Snapshot.SnapshotID != first.Snapshot.SnapshotID || git.ResolveCount() != resolveCalls {
+		t.Fatalf("幂等重试应只补发已保存事件：result=%#v resolves=%d err=%v", second, git.ResolveCount(), secondErr)
+	}
+	attempts, delivered := publisher.Counts()
+	if attempts != 2 || delivered != 1 {
+		t.Fatalf("发布恢复次数错误：attempts=%d delivered=%d", attempts, delivered)
+	}
+}
+
+// TestServiceProducesConsistentTerminalMetadata 验证成功结果中的 Job、Snapshot、EntityMeta
+// 使用一致终态，并满足 CreatedAt <= UpdatedAt <= Event.OccurredAt 的时间顺序。
+func TestServiceProducesConsistentTerminalMetadata(t *testing.T) {
+	sha := "1111111111111111111111111111111111111111"
+	clock := &steppingClock{now: time.Date(2026, 8, 20, 1, 0, 0, 0, time.UTC), step: time.Second}
+	git := &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {}}}
+	service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), memory.NewRepositoryStore(), recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, clock, repositoryapp.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, syncErr := service.Sync(context.Background(), repository.SyncCommand{
+		Scope: common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}, RepositoryPath: "repo", Ref: "main", IdempotencyKey: "metadata",
+	})
+	if syncErr != nil {
+		t.Fatal(syncErr)
+	}
+	if result.Job.Status != repository.StatusSucceeded || result.Job.EntityMeta.Status != string(repository.StatusSucceeded) || result.Job.Progress != 100 ||
+		result.Snapshot.SyncStatus != repository.StatusSucceeded || result.Snapshot.EntityMeta.Status != string(repository.StatusSucceeded) {
+		t.Fatalf("终态字段不一致：job=%#v snapshot=%#v", result.Job, result.Snapshot)
+	}
+	if result.Job.UpdatedAt != result.Snapshot.UpdatedAt || result.Job.UpdatedAt.Before(result.Job.CreatedAt) || result.Event.OccurredAt.Before(result.Job.UpdatedAt) {
+		t.Fatalf("终态时间顺序错误：created=%s updated=%s event=%s", result.Job.CreatedAt, result.Job.UpdatedAt, result.Event.OccurredAt)
+	}
+}
+
+// TestRepositoryEventsConformToPublishedSchemas 从 api/events 读取真实 Schema，
+// 对 Service 实际构造的完成和失败事件执行递归必填字段、常量与 JSON 类型校验。
+func TestRepositoryEventsConformToPublishedSchemas(t *testing.T) {
+	sha := "1111111111111111111111111111111111111111"
+	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}
+	t.Run("completed", func(t *testing.T) {
+		git := &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {}}}
+		service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), memory.NewRepositoryStore(), recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, syncErr := service.Sync(context.Background(), repository.SyncCommand{Scope: scope, RepositoryPath: "repo", Ref: "main", IdempotencyKey: "schema-completed"})
+		if syncErr != nil {
+			t.Fatal(syncErr)
+		}
+		assertEventMatchesSchema(t, result.Event, "parse.completed.v1.schema.json")
+	})
+	t.Run("failed", func(t *testing.T) {
+		git := &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {"a.py": []byte("def a(): pass")}}, readErr: errors.New("read failed")}
+		service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), memory.NewRepositoryStore(), recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, syncErr := service.Sync(context.Background(), repository.SyncCommand{Scope: scope, RepositoryPath: "repo", Ref: "main", IdempotencyKey: "schema-failed"})
+		if syncErr == nil {
+			t.Fatal("预期读取失败")
+		}
+		assertEventMatchesSchema(t, result.Event, "parse.failed.v1.schema.json")
+	})
+}
+
+// TestCompletedEventPayloadMatchesParseResult 验证事件中的数量与实际持久化结果来自同一份收口数据，
+// 避免消费者按错误的 artifact、relation 或 skipped 数量启动下游 Graph/RAG 工作。
+func TestCompletedEventPayloadMatchesParseResult(t *testing.T) {
+	sha := "1111111111111111111111111111111111111111"
+	git := &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {
+		"a.py": []byte("def a():\n    return helper()\n"), "main.go": []byte("package main"),
+	}}}
+	service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), memory.NewRepositoryStore(), recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, syncErr := service.Sync(context.Background(), repository.SyncCommand{
+		Scope: common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}, RepositoryPath: "repo", Ref: "main", IdempotencyKey: "event-counts",
+	})
+	if syncErr != nil {
+		t.Fatal(syncErr)
+	}
+	payload := result.Event.Payload
+	if payload["snapshot_id"] != result.Snapshot.SnapshotID || payload["commit_sha"] != result.Snapshot.CommitSHA ||
+		payload["artifact_count"] != len(result.Artifacts) || payload["relation_count"] != len(result.Relations) || payload["skipped_count"] != len(result.SkippedFiles) {
+		t.Fatalf("完成事件与 ParseResult 数量不一致：payload=%#v result=%#v", payload, result)
+	}
+}
+
 func TestServicePersistsSanitizedFailure(t *testing.T) {
 	sha := "1111111111111111111111111111111111111111"
 	git := &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {"a.py": []byte("def a(): pass")}}, readErr: errors.New("secret token abc")}
@@ -1213,5 +1446,95 @@ func TestNewRejectsNonPositiveResourceLimits(t *testing.T) {
 				t.Fatalf("非正数资源上限应返回配置错误，实际配置为：%#v", tt.config)
 			}
 		})
+	}
+}
+
+// assertEventMatchesSchema 使用仓库中的真实 JSON Schema 校验事件。
+// 只实现这些事件 Schema 实际使用的关键字，避免测试复制一份独立的事件模板。
+func assertEventMatchesSchema(t *testing.T, event common.EventEnvelope, schemaName string) {
+	t.Helper()
+	schemaBytes, err := os.ReadFile(filepath.Join("..", "..", "..", "api", "events", schemaName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(schemaBytes, &schema); err != nil {
+		t.Fatal(err)
+	}
+	eventBytes, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document any
+	if err := json.Unmarshal(eventBytes, &document); err != nil {
+		t.Fatal(err)
+	}
+	validateJSONSchemaNode(t, schema, document, "event")
+}
+
+func validateJSONSchemaNode(t *testing.T, schema map[string]any, value any, location string) {
+	t.Helper()
+	if constant, exists := schema["const"]; exists && !reflect.DeepEqual(constant, value) {
+		t.Fatalf("%s 不符合 const：got=%#v want=%#v", location, value, constant)
+	}
+	if expectedType, _ := schema["type"].(string); expectedType != "" && !matchesJSONType(expectedType, value) {
+		t.Fatalf("%s JSON 类型错误：got=%T want=%s value=%#v", location, value, expectedType, value)
+	}
+	object, isObject := value.(map[string]any)
+	if !isObject {
+		return
+	}
+	for _, required := range stringValues(schema["required"]) {
+		if _, exists := object[required]; !exists {
+			t.Fatalf("%s 缺少必填字段 %q", location, required)
+		}
+	}
+	properties, _ := schema["properties"].(map[string]any)
+	if additional, exists := schema["additionalProperties"].(bool); exists && !additional {
+		for key := range object {
+			if _, declared := properties[key]; !declared {
+				t.Fatalf("%s 包含 Schema 未声明字段 %q", location, key)
+			}
+		}
+	}
+	for key, rawProperty := range properties {
+		propertySchema, ok := rawProperty.(map[string]any)
+		propertyValue, exists := object[key]
+		if ok && exists {
+			validateJSONSchemaNode(t, propertySchema, propertyValue, location+"."+key)
+		}
+	}
+}
+
+func stringValues(value any) []string {
+	raw, _ := value.([]any)
+	result := make([]string, 0, len(raw))
+	for _, item := range raw {
+		if text, ok := item.(string); ok {
+			result = append(result, text)
+		}
+	}
+	return result
+}
+
+func matchesJSONType(expected string, value any) bool {
+	switch expected {
+	case "object":
+		_, ok := value.(map[string]any)
+		return ok
+	case "array":
+		_, ok := value.([]any)
+		return ok
+	case "string":
+		_, ok := value.(string)
+		return ok
+	case "boolean":
+		_, ok := value.(bool)
+		return ok
+	case "integer":
+		number, ok := value.(float64)
+		return ok && number == float64(int64(number))
+	default:
+		return true
 	}
 }

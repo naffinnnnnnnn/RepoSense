@@ -51,3 +51,35 @@ func TestArtifactsUsesBoundedCursorPagination(t *testing.T) {
 		t.Fatalf("第二页结果异常：%#v %q %v", second, cursor, err)
 	}
 }
+
+// TestStoreRejectsInconsistentParseResultStatus 验证持久化边界不会接受互相矛盾的终态。
+// Job.Status、Snapshot.SyncStatus 和两个 EntityMeta.Status 必须表达同一个解析结果。
+func TestStoreRejectsInconsistentParseResultStatus(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*repository.ParseResult)
+	}{
+		{name: "snapshot_meta_mismatch", mutate: func(result *repository.ParseResult) {
+			result.Snapshot.EntityMeta.Status = string(repository.StatusFailed)
+		}},
+		{name: "job_meta_mismatch", mutate: func(result *repository.ParseResult) {
+			result.Job.EntityMeta.Status = string(repository.StatusFailed)
+		}},
+		{name: "job_snapshot_mismatch", mutate: func(result *repository.ParseResult) {
+			result.Job.Status = repository.StatusFailed
+			result.Job.EntityMeta.Status = string(repository.StatusFailed)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := repository.ParseResult{
+				Snapshot: repository.Snapshot{EntityMeta: common.EntityMeta{TenantID: "tenant", RepositoryID: "repo", Status: string(repository.StatusSucceeded)}, SnapshotID: "snapshot", CommitSHA: "sha", SyncStatus: repository.StatusSucceeded},
+				Job:      repository.ParseJob{EntityMeta: common.EntityMeta{TenantID: "tenant", RepositoryID: "repo", Status: string(repository.StatusSucceeded)}, JobID: "job", SnapshotID: "snapshot", Status: repository.StatusSucceeded, Progress: 100},
+			}
+			tt.mutate(&result)
+			if err := NewRepositoryStore().SaveResult(context.Background(), "key", result); err == nil {
+				t.Fatalf("不一致的 ParseResult 终态不应持久化：%#v", result)
+			}
+		})
+	}
+}

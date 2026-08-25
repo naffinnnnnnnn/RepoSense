@@ -140,6 +140,33 @@ func TestAmbiguousSymbolStaysUnresolved(t *testing.T) {
 	}
 }
 
+// TestServiceRejectsFailedParseResultBeforeGraphBuild 验证 Graph 只消费成功的 ParseResult。
+// 失败结果可以为诊断而持久化，但不能生成 Active Graph Revision 或发布图事件。
+func TestServiceRejectsFailedParseResultBeforeGraphBuild(t *testing.T) {
+	repositories := memory.NewRepositoryStore()
+	graphs := memory.NewGraphRepository()
+	events := &eventSink{}
+	service, err := New(repositories, graphs, events, nil, &sequenceIDs{}, fixedClock{}, nil, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", SnapshotID: "failed-snapshot", TraceID: "trace"}
+	parsed := repository.ParseResult{
+		Snapshot: repository.Snapshot{EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID, Status: string(repository.StatusFailed)}, SnapshotID: scope.SnapshotID, CommitSHA: "sha", SyncStatus: repository.StatusFailed, ErrorCode: string(repository.ErrParseFailure)},
+		Job:      repository.ParseJob{EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID, Status: string(repository.StatusFailed)}, JobID: "job", SnapshotID: scope.SnapshotID, Status: repository.StatusFailed, ErrorCode: string(repository.ErrParseFailure)},
+	}
+	if err := repositories.SaveResult(context.Background(), "failed", parsed); err != nil {
+		t.Fatal(err)
+	}
+	_, buildErr := service.Build(context.Background(), graph.BuildCommand{Scope: scope, Mode: graph.BuildFull, IdempotencyKey: "graph-failed"})
+	if !graph.IsCode(buildErr, graph.ErrInvalidInput) {
+		t.Fatalf("Graph 必须拒绝失败的 ParseResult：%v", buildErr)
+	}
+	if len(events.events) != 0 {
+		t.Fatalf("失败 ParseResult 不应发布图事件：%#v", events.events)
+	}
+}
+
 func artifact(id string, kind repository.ArtifactKind, name, qualified, commit string, start, end int) repository.CodeArtifact {
 	return repository.CodeArtifact{ArtifactID: id, Kind: kind, Name: name, QualifiedName: qualified, Language: "python", SourceRef: common.SourceRef{CommitSHA: commit, Path: name + ".py", SymbolID: id, StartLine: start, EndLine: end, ContentHash: "sha256:x"}, ContentHash: "sha256:x"}
 }
