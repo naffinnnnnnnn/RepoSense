@@ -23,19 +23,241 @@ import (
 )
 
 type fakeGit struct {
-	commits  map[string]string
-	files    map[string]map[string][]byte
-	diffs    map[string][]repository.ChangedPath
-	readErr  error
-	mu       sync.Mutex
-	resolves int
-	reads    int
+	commits    map[string]string
+	files      map[string]map[string][]byte
+	diffs      map[string][]repository.ChangedPath
+	resolveErr error
+	listErr    error
+	diffErr    error
+	readErr    error
+	mu         sync.Mutex
+	resolves   int
+	reads      int
+}
+
+// TestServicePersistsFailuresFromEveryOperationalStage 对应 10.1：
+// ResolveCommit、LatestSnapshot、ListFiles、Diff 任一步骤失败，都必须形成可查询的失败任务，
+// 不能只把错误返回给当前调用者后丢失运行现场。
+func TestServicePersistsFailuresFromEveryOperationalStage(t *testing.T) {
+	const sha = "1111111111111111111111111111111111111111"
+	tests := []struct {
+		name         string
+		expectedCode repository.ErrorCode
+		configure    func(*fakeGit, *memory.RepositoryStore, common.Scope) ports.RepositoryStore
+	}{
+		{name: "resolve_commit", expectedCode: repository.ErrGitFailure, configure: func(git *fakeGit, store *memory.RepositoryStore, _ common.Scope) ports.RepositoryStore {
+			git.resolveErr = errors.New("远端引用查询失败")
+			return store
+		}},
+		{name: "latest_snapshot", expectedCode: repository.ErrPersistence, configure: func(_ *fakeGit, store *memory.RepositoryStore, _ common.Scope) ports.RepositoryStore {
+			return latestErrorStore{delegate: store, err: errors.New("增量基线存储不可用")}
+		}},
+		{name: "list_files", expectedCode: repository.ErrGitFailure, configure: func(git *fakeGit, store *memory.RepositoryStore, _ common.Scope) ports.RepositoryStore {
+			git.listErr = errors.New("文件列表读取失败")
+			return store
+		}},
+		{name: "diff", expectedCode: repository.ErrGitFailure, configure: func(git *fakeGit, store *memory.RepositoryStore, scope common.Scope) ports.RepositoryStore {
+			baseline := repository.ParseResult{
+				Snapshot: repository.Snapshot{EntityMeta: repository.NewMeta("baseline", scope, repository.StatusSucceeded, fixedClock{}.Now()), SnapshotID: "baseline", CommitSHA: "0000000000000000000000000000000000000000", SyncStatus: repository.StatusSucceeded},
+				Job:      repository.ParseJob{EntityMeta: repository.NewMeta("baseline-job", scope, repository.StatusSucceeded, fixedClock{}.Now()), JobID: "baseline-job", SnapshotID: "baseline", Status: repository.StatusSucceeded, Progress: 100},
+			}
+			if err := store.SaveResult(context.Background(), "baseline-key", baseline); err != nil {
+				t.Fatalf("准备增量基线失败：%v", err)
+			}
+			git.diffErr = errors.New("Git diff 执行失败")
+			return store
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scope := common.Scope{TenantID: "tenant", RepositoryID: "repo-" + tt.name, TraceID: "trace-10-1"}
+			git := &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {"a.py": []byte("def a(): pass")}}, diffs: map[string][]repository.ChangedPath{}}
+			backing := memory.NewRepositoryStore()
+			store := tt.configure(git, backing, scope)
+			service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), store, recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := repository.SyncCommand{Scope: scope, RepositoryPath: "ignored", Ref: "main", IdempotencyKey: "failure-key"}
+			result, syncErr := service.Sync(context.Background(), cmd)
+			if syncErr == nil {
+				t.Fatal("运行步骤失败时 Sync 不应返回成功")
+			}
+			if !repository.IsCode(syncErr, tt.expectedCode) {
+				t.Errorf("错误未按失败步骤分类：got=%v want=%s", syncErr, tt.expectedCode)
+			}
+			if result.Job.JobID == "" || result.Snapshot.SnapshotID == "" || result.Job.Status != repository.StatusFailed || result.Snapshot.SyncStatus != repository.StatusFailed {
+				t.Errorf("返回值没有保留完整失败任务：%#v", result)
+			}
+			cached, found, lookupErr := backing.FindByIdempotencyKey(context.Background(), scope, cmd.IdempotencyKey)
+			if lookupErr != nil {
+				t.Fatalf("查询失败现场异常：%v", lookupErr)
+			}
+			if !found || cached.Job.Status != repository.StatusFailed || cached.Event.EventType != "parse.failed.v1" {
+				t.Errorf("失败现场未被持久化：found=%v result=%#v", found, cached)
+			}
+		})
+	}
+}
+
+// TestFailureRetryabilityMatchesCause 对应 10.2：可重试性属于错误策略，
+// 确定性的语法解析错误不应重试，暂时性的仓库读取故障才应重试。
+func TestFailureRetryabilityMatchesCause(t *testing.T) {
+	const sha = "2222222222222222222222222222222222222222"
+	tests := []struct {
+		name      string
+		git       *fakeGit
+		registry  ports.ParserRegistry
+		wantRetry bool
+	}{
+		{name: "deterministic_parse_failure", git: &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {"a.test": []byte("invalid")}}}, registry: fixedParserRegistry{parser: &countingLanguageParser{parseErr: errors.New("语法结构无效")}}, wantRetry: false},
+		{name: "transient_git_read_failure", git: &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {"a.py": []byte("def a(): pass")}}, readErr: errors.New("Git 对象库暂时不可用")}, registry: parseradapter.DefaultRegistry(), wantRetry: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			service, err := repositoryapp.New(tt.git, tt.registry, memory.NewRepositoryStore(), recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, syncErr := service.Sync(context.Background(), repository.SyncCommand{Scope: common.Scope{TenantID: "tenant", RepositoryID: "repo"}, RepositoryPath: "ignored", Ref: "main", IdempotencyKey: "key"})
+			var domainErr *repository.DomainError
+			if !errors.As(syncErr, &domainErr) {
+				t.Fatalf("失败必须返回 DomainError：%v", syncErr)
+			}
+			if domainErr.Retryable != tt.wantRetry {
+				t.Errorf("DomainError.Retryable=%v，期望 %v", domainErr.Retryable, tt.wantRetry)
+			}
+			if got, ok := result.Event.Payload["retryable"].(bool); !ok || got != tt.wantRetry {
+				t.Errorf("失败事件 retryable=%#v，期望 %v", result.Event.Payload["retryable"], tt.wantRetry)
+			}
+		})
+	}
+}
+
+// TestFailureReportingPreservesPrimaryAndSecondaryCauses 对应 10.3：
+// 保存或发布失败状态属于二次失败，返回错误必须同时保留原始解析错误和二次错误。
+func TestFailureReportingPreservesPrimaryAndSecondaryCauses(t *testing.T) {
+	const sha = "3333333333333333333333333333333333333333"
+	primary := errors.New("源文件语法解析失败")
+	newGit := func() *fakeGit {
+		return &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {"a.test": []byte("invalid")}}}
+	}
+	newRegistry := func() ports.ParserRegistry {
+		return fixedParserRegistry{parser: &countingLanguageParser{parseErr: primary}}
+	}
+
+	t.Run("save_failure", func(t *testing.T) {
+		secondary := errors.New("失败状态数据库写入失败")
+		store := saveErrorStore{delegate: memory.NewRepositoryStore(), err: secondary}
+		service, err := repositoryapp.New(newGit(), newRegistry(), store, recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, syncErr := service.Sync(context.Background(), repository.SyncCommand{Scope: common.Scope{TenantID: "tenant", RepositoryID: "repo-save"}, RepositoryPath: "ignored", Ref: "main", IdempotencyKey: "key"})
+		if result.Job.Status != repository.StatusFailed {
+			t.Errorf("二次保存失败时仍应返回阶段性失败结果：%#v", result.Job)
+		}
+		if !errors.Is(syncErr, primary) || !errors.Is(syncErr, secondary) {
+			t.Errorf("错误链必须同时保留主错误和保存错误：%v", syncErr)
+		}
+	})
+
+	t.Run("publish_failure", func(t *testing.T) {
+		secondary := errors.New("失败事件 Broker 不可用")
+		store := memory.NewRepositoryStore()
+		service, err := repositoryapp.New(newGit(), newRegistry(), store, errorPublisher{err: secondary}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		scope := common.Scope{TenantID: "tenant", RepositoryID: "repo-publish"}
+		_, syncErr := service.Sync(context.Background(), repository.SyncCommand{Scope: scope, RepositoryPath: "ignored", Ref: "main", IdempotencyKey: "key"})
+		if !errors.Is(syncErr, primary) || !errors.Is(syncErr, secondary) {
+			t.Errorf("错误链必须同时保留主错误和发布错误：%v", syncErr)
+		}
+		if cached, found, _ := store.FindByIdempotencyKey(context.Background(), scope, "key"); !found || cached.Job.Status != repository.StatusFailed {
+			t.Errorf("发布二次失败不应破坏已保存的失败现场：found=%v result=%#v", found, cached)
+		}
+	})
+}
+
+// TestFailureMessagesPreserveSanitizedOperationMeaning 对应 10.4：
+// 对外信息不泄漏底层细节，但至少应区分 Git 读取失败与代码解析失败。
+func TestFailureMessagesPreserveSanitizedOperationMeaning(t *testing.T) {
+	const sha = "4444444444444444444444444444444444444444"
+	tests := []struct {
+		name        string
+		git         *fakeGit
+		registry    ports.ParserRegistry
+		wantCode    repository.ErrorCode
+		wantOp      string
+		wantMessage string
+	}{
+		{name: "read_file", git: &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {"a.py": []byte("def a(): pass")}}, readErr: errors.New("secret object path")}, registry: parseradapter.DefaultRegistry(), wantCode: repository.ErrGitFailure, wantOp: "read_file", wantMessage: "读取仓库文件失败"},
+		{name: "parse_file", git: &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {"a.test": []byte("invalid")}}}, registry: fixedParserRegistry{parser: &countingLanguageParser{parseErr: errors.New("secret parser detail")}}, wantCode: repository.ErrParseFailure, wantOp: "parse_file", wantMessage: "代码文件解析失败"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			service, err := repositoryapp.New(tt.git, tt.registry, memory.NewRepositoryStore(), recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, syncErr := service.Sync(context.Background(), repository.SyncCommand{Scope: common.Scope{TenantID: "tenant", RepositoryID: "repo"}, RepositoryPath: "ignored", Ref: "main", IdempotencyKey: "key"})
+			var domainErr *repository.DomainError
+			if !errors.As(syncErr, &domainErr) {
+				t.Fatalf("失败必须返回 DomainError：%v", syncErr)
+			}
+			if domainErr.Code != tt.wantCode || domainErr.Operation != tt.wantOp || domainErr.Message != tt.wantMessage {
+				t.Errorf("对外错误语义不准确：%#v", domainErr)
+			}
+			if result.Job.ErrorMessage != tt.wantMessage || result.Snapshot.ErrorMessage != tt.wantMessage {
+				t.Errorf("持久化错误语义不准确：job=%q snapshot=%q", result.Job.ErrorMessage, result.Snapshot.ErrorMessage)
+			}
+		})
+	}
+}
+
+// TestIdempotencyRetryReexecutesFailedResult 对应 10.6：失败记录是重试依据而不是成功缓存。
+// 同一幂等键在依赖恢复后必须重新执行，并以新的成功结果替换失败现场。
+func TestIdempotencyRetryReexecutesFailedResult(t *testing.T) {
+	const sha = "5555555555555555555555555555555555555555"
+	readCause := errors.New("Git 对象库暂时不可用")
+	git := &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {"a.py": []byte("def a(): pass")}}, readErr: readCause}
+	store := memory.NewRepositoryStore()
+	service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), store, recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := repository.SyncCommand{Scope: common.Scope{TenantID: "tenant", RepositoryID: "repo-retry"}, RepositoryPath: "ignored", Ref: "main", IdempotencyKey: "same-key"}
+	failed, firstErr := service.Sync(context.Background(), cmd)
+	if firstErr == nil || failed.Job.Status != repository.StatusFailed {
+		t.Fatalf("首次调用应保存失败结果：result=%#v err=%v", failed, firstErr)
+	}
+	resolvedBeforeRetry := git.ResolveCount()
+	git.readErr = nil
+
+	retried, retryErr := service.Sync(context.Background(), cmd)
+	if retryErr != nil {
+		t.Fatalf("依赖恢复后同一幂等键应允许重试：%v", retryErr)
+	}
+	if retried.Job.Status != repository.StatusSucceeded || retried.Snapshot.SyncStatus != repository.StatusSucceeded {
+		t.Errorf("重试没有产生成功终态：%#v", retried)
+	}
+	if git.ResolveCount() <= resolvedBeforeRetry {
+		t.Error("失败幂等记录被当作成功缓存，实际解析流程没有重新执行")
+	}
+	if retried.Snapshot.SnapshotID == failed.Snapshot.SnapshotID {
+		t.Error("重试应创建新的运行实例，不能复用失败快照 ID")
+	}
 }
 
 func (f *fakeGit) ResolveCommit(_ context.Context, _ string, ref string) (string, error) {
 	f.mu.Lock()
 	f.resolves++
 	f.mu.Unlock()
+	if f.resolveErr != nil {
+		return "", f.resolveErr
+	}
 	value, ok := f.commits[ref]
 	if !ok {
 		return "", errors.New("ref 不存在")
@@ -48,6 +270,9 @@ func (f *fakeGit) ResolveCount() int {
 	return f.resolves
 }
 func (f *fakeGit) ListFiles(_ context.Context, _ string, commit string) ([]string, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	var out []string
 	for name := range f.files[commit] {
 		out = append(out, name)
@@ -55,6 +280,9 @@ func (f *fakeGit) ListFiles(_ context.Context, _ string, commit string) ([]strin
 	return out, nil
 }
 func (f *fakeGit) Diff(_ context.Context, _ string, from, to string) ([]repository.ChangedPath, error) {
+	if f.diffErr != nil {
+		return nil, f.diffErr
+	}
 	return f.diffs[from+":"+to], nil
 }
 func (f *fakeGit) ReadFile(_ context.Context, _ string, commit, path string) ([]byte, error) {
@@ -177,6 +405,34 @@ type saveErrorStore struct {
 	delegate *memory.RepositoryStore
 	err      error
 }
+
+// latestErrorStore 只让增量基线查询失败，其他存储行为仍由真实内存实现完成，
+// 用于验证早期失败也能进入统一失败持久化流程。
+type latestErrorStore struct {
+	delegate *memory.RepositoryStore
+	err      error
+}
+
+func (s latestErrorStore) FindByIdempotencyKey(ctx context.Context, scope common.Scope, key string) (repository.ParseResult, bool, error) {
+	return s.delegate.FindByIdempotencyKey(ctx, scope, key)
+}
+func (s latestErrorStore) LatestSnapshot(context.Context, common.Scope) (repository.Snapshot, bool, error) {
+	return repository.Snapshot{}, false, s.err
+}
+func (s latestErrorStore) SaveResult(ctx context.Context, key string, result repository.ParseResult) error {
+	return s.delegate.SaveResult(ctx, key, result)
+}
+func (s latestErrorStore) GetSnapshot(ctx context.Context, scope common.Scope) (repository.Snapshot, error) {
+	return s.delegate.GetSnapshot(ctx, scope)
+}
+func (s latestErrorStore) Artifacts(ctx context.Context, scope common.Scope, cursor string, limit int) ([]repository.CodeArtifact, string, error) {
+	return s.delegate.Artifacts(ctx, scope, cursor, limit)
+}
+
+// errorPublisher 稳定模拟失败事件无法发布，便于同时检查主错误和二次错误。
+type errorPublisher struct{ err error }
+
+func (p errorPublisher) Publish(context.Context, common.EventEnvelope) error { return p.err }
 
 func (s saveErrorStore) FindByIdempotencyKey(ctx context.Context, scope common.Scope, key string) (repository.ParseResult, bool, error) {
 	return s.delegate.FindByIdempotencyKey(ctx, scope, key)

@@ -83,3 +83,23 @@ func TestStoreRejectsInconsistentParseResultStatus(t *testing.T) {
 		})
 	}
 }
+
+// TestArtifactsRejectsFailedSnapshot 对应 10.5：失败任务即使已经聚合了部分 Artifact，
+// 下游也不能把这些不完整数据当作可消费的成功快照返回。
+func TestArtifactsRejectsFailedSnapshot(t *testing.T) {
+	store := NewRepositoryStore()
+	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", SnapshotID: "failed-snapshot"}
+	result := repository.ParseResult{
+		Snapshot:  repository.Snapshot{EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID, Status: string(repository.StatusFailed)}, SnapshotID: scope.SnapshotID, CommitSHA: "sha", SyncStatus: repository.StatusFailed},
+		Job:       repository.ParseJob{EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID, Status: string(repository.StatusFailed)}, JobID: "failed-job", SnapshotID: scope.SnapshotID, Status: repository.StatusFailed},
+		Artifacts: []repository.CodeArtifact{{ArtifactID: "partial-artifact", Kind: repository.ArtifactFunction, Name: "partial"}},
+	}
+	if err := store.SaveResult(context.Background(), "failed-key", result); err != nil {
+		t.Fatalf("准备失败快照异常：%v", err)
+	}
+
+	artifacts, _, err := store.Artifacts(context.Background(), scope, "", 100)
+	if err == nil {
+		t.Fatalf("失败快照的部分 Artifact 不应暴露给下游：%#v", artifacts)
+	}
+}
