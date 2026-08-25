@@ -79,3 +79,17 @@ func TestValidatePatternsRejectsWindowsAbsolutePaths(t *testing.T) {
 		})
 	}
 }
+
+// TestFilterChangesReturnsIndependentSliceWithoutPatterns 验证无 IncludePaths 时也要返回独立切片。
+// Service 后续会对结果排序；如果直接复用 Git 适配器的底层数组，就会反向修改依赖方持有的数据。
+func TestFilterChangesReturnsIndependentSliceWithoutPatterns(t *testing.T) {
+	changes := []repository.ChangedPath{
+		{Path: "z.go", Kind: repository.ChangeModified},
+		{Path: "a.go", Kind: repository.ChangeAdded},
+	}
+	filtered := filterChanges(changes, nil)
+	filtered[0].Path = "mutated.go"
+	if changes[0].Path != "z.go" {
+		t.Fatalf("过滤结果与输入共享底层数组，原始 Git 变更被修改为：%#v", changes)
+	}
+}

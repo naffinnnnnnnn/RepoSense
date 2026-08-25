@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +26,7 @@ type fakeGit struct {
 	readErr  error
 	mu       sync.Mutex
 	resolves int
+	reads    int
 }
 
 func (f *fakeGit) ResolveCommit(_ context.Context, _ string, ref string) (string, error) {
@@ -53,10 +55,18 @@ func (f *fakeGit) Diff(_ context.Context, _ string, from, to string) ([]reposito
 	return f.diffs[from+":"+to], nil
 }
 func (f *fakeGit) ReadFile(_ context.Context, _ string, commit, path string) ([]byte, error) {
+	f.mu.Lock()
+	f.reads++
+	f.mu.Unlock()
 	if f.readErr != nil {
 		return nil, f.readErr
 	}
 	return f.files[commit][path], nil
+}
+func (f *fakeGit) ReadCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reads
 }
 
 type sequenceIDs struct {
@@ -640,6 +650,213 @@ func TestServiceFallsBackToFullSyncWhenPreviousCommitDisappears(t *testing.T) {
 	}
 	if result.Job.Scope != repository.ScopeFull || result.Snapshot.ParentSnapshotID != "" || git.listed != 1 {
 		t.Fatalf("强推降级结果不完整：scope=%s parent=%q list_calls=%d", result.Job.Scope, result.Snapshot.ParentSnapshotID, git.listed)
+	}
+}
+
+// TestServiceAppliesMaxFilesAfterFilteringBeforeReads 验证文件数上限针对实际解析范围，
+// 并且超限判断必须发生在任何 ReadFile 调用之前，避免已知无效请求继续消耗 I/O。
+func TestServiceAppliesMaxFilesAfterFilteringBeforeReads(t *testing.T) {
+	sha := "1111111111111111111111111111111111111111"
+	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}
+	t.Run("filter_then_limit", func(t *testing.T) {
+		git := &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {
+			"src/a.py": []byte("def a(): pass"), "docs/readme.md": []byte("docs"),
+		}}}
+		service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), memory.NewRepositoryStore(), recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.Config{MaxFiles: 1, MaxFileBytes: 1024})
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, syncErr := service.Sync(context.Background(), repository.SyncCommand{
+			Scope: scope, RepositoryPath: "repo", Ref: "main", IncludePaths: []string{"src/**"}, IdempotencyKey: "filtered",
+		})
+		if syncErr != nil || len(result.Snapshot.ChangedPaths) != 1 || result.Snapshot.ChangedPaths[0].Path != "src/a.py" || git.ReadCount() != 1 {
+			t.Fatalf("应先过滤再应用文件数上限：result=%#v reads=%d err=%v", result.Snapshot.ChangedPaths, git.ReadCount(), syncErr)
+		}
+	})
+	t.Run("reject_before_read", func(t *testing.T) {
+		git := &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {
+			"src/a.py": []byte("def a(): pass"), "src/b.py": []byte("def b(): pass"),
+		}}}
+		service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), memory.NewRepositoryStore(), recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.Config{MaxFiles: 1, MaxFileBytes: 1024})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, syncErr := service.Sync(context.Background(), repository.SyncCommand{
+			Scope: scope, RepositoryPath: "repo", Ref: "main", IncludePaths: []string{"src/**"}, IdempotencyKey: "too-many",
+		})
+		if !repository.IsCode(syncErr, repository.ErrInvalidInput) || git.ReadCount() != 0 {
+			t.Fatalf("超限应在读取文件前拒绝：reads=%d err=%v", git.ReadCount(), syncErr)
+		}
+	})
+}
+
+// TestServiceRejectsMalformedGitChanges 验证 ChangedPath 不是可信输入。
+// 空路径、未知 Kind 和结构不完整的 Rename 都必须在排序及读取文件前被统一拒绝。
+func TestServiceRejectsMalformedGitChanges(t *testing.T) {
+	baseSHA := "0000000000000000000000000000000000000000"
+	currentSHA := "1111111111111111111111111111111111111111"
+	tests := []struct {
+		name   string
+		change repository.ChangedPath
+	}{
+		{name: "empty_path", change: repository.ChangedPath{Kind: repository.ChangeModified}},
+		{name: "unknown_kind", change: repository.ChangedPath{Path: "safe.unsupported", Kind: repository.ChangeKind("UNKNOWN")}},
+		{name: "rename_without_old_path", change: repository.ChangedPath{Path: "safe.unsupported", Kind: repository.ChangeRenamed}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}
+			store := memory.NewRepositoryStore()
+			base := repository.ParseResult{Snapshot: repository.Snapshot{
+				EntityMeta: repository.NewMeta("base", scope, repository.StatusSucceeded, fixedClock{}.Now()),
+				SnapshotID: "base", CommitSHA: baseSHA, SyncStatus: repository.StatusSucceeded,
+			}}
+			if err := store.SaveResult(context.Background(), "base", base); err != nil {
+				t.Fatal(err)
+			}
+			git := &fakeGit{
+				commits: map[string]string{"main": currentSHA},
+				files:   map[string]map[string][]byte{currentSHA: {}},
+				diffs:   map[string][]repository.ChangedPath{baseSHA + ":" + currentSHA: {tt.change}},
+			}
+			service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), store, recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, syncErr := service.Sync(context.Background(), repository.SyncCommand{
+				Scope: scope, RepositoryPath: "repo", Ref: "main", IdempotencyKey: "malformed-" + tt.name,
+			})
+			var domainErr *repository.DomainError
+			if !errors.As(syncErr, &domainErr) || domainErr.Code != repository.ErrGitFailure || domainErr.Operation != "validate_changes" || domainErr.Retryable {
+				t.Fatalf("畸形 Git 变更应返回不可重试的 validate_changes 错误：%v", syncErr)
+			}
+			if git.ReadCount() != 0 {
+				t.Fatalf("变更校验失败后不应读取文件，reads=%d", git.ReadCount())
+			}
+		})
+	}
+}
+
+// TestServiceDeduplicatesIdenticalGitChanges 验证适配器偶然返回重复条目时，
+// 同一 Path、OldPath 和 Kind 只进入一次解析范围，避免重复解析和重复 Artifact。
+func TestServiceDeduplicatesIdenticalGitChanges(t *testing.T) {
+	baseSHA := "0000000000000000000000000000000000000000"
+	currentSHA := "1111111111111111111111111111111111111111"
+	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}
+	store := memory.NewRepositoryStore()
+	base := repository.ParseResult{Snapshot: repository.Snapshot{
+		EntityMeta: repository.NewMeta("base", scope, repository.StatusSucceeded, fixedClock{}.Now()),
+		SnapshotID: "base", CommitSHA: baseSHA, SyncStatus: repository.StatusSucceeded,
+	}}
+	if err := store.SaveResult(context.Background(), "base", base); err != nil {
+		t.Fatal(err)
+	}
+	duplicate := repository.ChangedPath{Path: "same.unsupported", Kind: repository.ChangeModified}
+	git := &fakeGit{
+		commits: map[string]string{"main": currentSHA},
+		files:   map[string]map[string][]byte{currentSHA: {}},
+		diffs:   map[string][]repository.ChangedPath{baseSHA + ":" + currentSHA: {duplicate, duplicate}},
+	}
+	service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), store, recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, syncErr := service.Sync(context.Background(), repository.SyncCommand{
+		Scope: scope, RepositoryPath: "repo", Ref: "main", IdempotencyKey: "duplicates",
+	})
+	if syncErr != nil {
+		t.Fatal(syncErr)
+	}
+	if len(result.Snapshot.ChangedPaths) != 1 || result.Snapshot.ChangedPaths[0] != duplicate {
+		t.Fatalf("完全相同的 Git 变更应被去重：%#v", result.Snapshot.ChangedPaths)
+	}
+}
+
+// TestServiceOrdersEqualPathsDeterministically 验证 Path 相同时仍有 Kind、OldPath 等次级排序规则。
+// 同一组变更无论适配器返回顺序如何，都必须生成完全相同的 ChangedPaths。
+func TestServiceOrdersEqualPathsDeterministically(t *testing.T) {
+	baseSHA := "0000000000000000000000000000000000000000"
+	currentSHA := "1111111111111111111111111111111111111111"
+	modified := repository.ChangedPath{Path: "same.unsupported", Kind: repository.ChangeModified}
+	renamed := repository.ChangedPath{Path: "same.unsupported", OldPath: "old.unsupported", Kind: repository.ChangeRenamed}
+	run := func(changes []repository.ChangedPath, key string) []repository.ChangedPath {
+		t.Helper()
+		scope := common.Scope{TenantID: "tenant", RepositoryID: "repo-" + key, TraceID: "trace"}
+		store := memory.NewRepositoryStore()
+		base := repository.ParseResult{Snapshot: repository.Snapshot{
+			EntityMeta: repository.NewMeta("base", scope, repository.StatusSucceeded, fixedClock{}.Now()),
+			SnapshotID: "base", CommitSHA: baseSHA, SyncStatus: repository.StatusSucceeded,
+		}}
+		if err := store.SaveResult(context.Background(), "base", base); err != nil {
+			t.Fatal(err)
+		}
+		git := &fakeGit{commits: map[string]string{"main": currentSHA}, files: map[string]map[string][]byte{currentSHA: {}}, diffs: map[string][]repository.ChangedPath{baseSHA + ":" + currentSHA: changes}}
+		service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), store, recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, syncErr := service.Sync(context.Background(), repository.SyncCommand{
+			Scope: scope, RepositoryPath: "repo", Ref: "main", IdempotencyKey: key,
+		})
+		if syncErr != nil {
+			t.Fatal(syncErr)
+		}
+		return result.Snapshot.ChangedPaths
+	}
+	forward := run([]repository.ChangedPath{modified, renamed}, "forward")
+	reverse := run([]repository.ChangedPath{renamed, modified}, "reverse")
+	if !reflect.DeepEqual(forward, reverse) {
+		t.Fatalf("相同 Path 的输出顺序依赖适配器输入：forward=%#v reverse=%#v", forward, reverse)
+	}
+}
+
+// TestServiceValidatesDeletedAndRenamedOldPaths 验证所有进入结果的路径都经过仓库相对路径检查。
+// Deleted 不调用 ReadFile，Rename 的 OldPath 也不会传给 ReadFile，因此必须在变更校验阶段单独覆盖。
+func TestServiceValidatesDeletedAndRenamedOldPaths(t *testing.T) {
+	baseSHA := "0000000000000000000000000000000000000000"
+	currentSHA := "1111111111111111111111111111111111111111"
+	tests := []struct {
+		name   string
+		change repository.ChangedPath
+		files  map[string][]byte
+	}{
+		{name: "unsafe_deleted_path", change: repository.ChangedPath{Path: "../secret.go", Kind: repository.ChangeDeleted}, files: map[string][]byte{}},
+		{name: "unsafe_rename_old_path", change: repository.ChangedPath{Path: "safe.go", OldPath: "../secret.go", Kind: repository.ChangeRenamed}, files: map[string][]byte{"safe.go": []byte("package safe")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}
+			store := memory.NewRepositoryStore()
+			base := repository.ParseResult{Snapshot: repository.Snapshot{
+				EntityMeta: repository.NewMeta("base", scope, repository.StatusSucceeded, fixedClock{}.Now()),
+				SnapshotID: "base", CommitSHA: baseSHA, SyncStatus: repository.StatusSucceeded,
+			}}
+			if err := store.SaveResult(context.Background(), "base", base); err != nil {
+				t.Fatal(err)
+			}
+			git := &fakeGit{
+				commits: map[string]string{"main": currentSHA},
+				files:   map[string]map[string][]byte{currentSHA: tt.files},
+				diffs:   map[string][]repository.ChangedPath{baseSHA + ":" + currentSHA: {tt.change}},
+			}
+			service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), store, recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			key := "unsafe-" + tt.name
+			_, syncErr := service.Sync(context.Background(), repository.SyncCommand{
+				Scope: scope, RepositoryPath: "repo", Ref: "main", IdempotencyKey: key,
+			})
+			if !repository.IsCode(syncErr, repository.ErrGitFailure) {
+				t.Fatalf("不安全的删除语义路径必须被拒绝：%v", syncErr)
+			}
+			if git.ReadCount() != 0 {
+				t.Fatalf("路径校验必须发生在 ReadFile 前，reads=%d", git.ReadCount())
+			}
+			if _, saved, lookupErr := store.FindByIdempotencyKey(context.Background(), scope, key); lookupErr != nil || saved {
+				t.Fatalf("不安全变更不应被持久化：saved=%v err=%v", saved, lookupErr)
+			}
+		})
 	}
 }
 
