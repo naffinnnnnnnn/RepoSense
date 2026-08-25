@@ -220,6 +220,44 @@ func TestDiffHandlesCopyAndRejectsUnknownStatus(t *testing.T) {
 	})
 }
 
+// TestClientExcludesNonBlobTreeEntries 验证 ls-tree 结果必须读取对象类型。
+// Gitlink 指向 commit 而不是 Blob；即使路径伪装成 .go，也不能进入源码解析或被 ReadFile 当作普通文件。
+func TestClientExcludesNonBlobTreeEntries(t *testing.T) {
+	repoPath := t.TempDir()
+	git(t, repoPath, "init", "-b", "main")
+	git(t, repoPath, "config", "user.email", "test@reposense.local")
+	git(t, repoPath, "config", "user.name", "RepoSense Test")
+	write(t, repoPath, "main.go", "package main\n")
+	git(t, repoPath, "add", "main.go")
+	git(t, repoPath, "commit", "-m", "base")
+	client := New()
+	base, err := client.ResolveCommit(context.Background(), repoPath, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// mode 160000 创建一个类似 submodule 的 Gitlink，路径扩展名故意伪装成受支持源码。
+	git(t, repoPath, "update-index", "--add", "--cacheinfo", "160000", base, "vendor.go")
+	git(t, repoPath, "commit", "-m", "add gitlink")
+	commit, err := client.ResolveCommit(context.Background(), repoPath, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := client.ListFiles(context.Background(), repoPath, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		if file == "vendor.go" {
+			t.Errorf("ListFiles 不应返回非 Blob 的 Gitlink：%#v", files)
+		}
+	}
+	_, readErr := client.ReadFile(context.Background(), repoPath, commit, "vendor.go")
+	var domainErr *repository.DomainError
+	if !errors.As(readErr, &domainErr) || domainErr.Code != repository.ErrGitFailure || domainErr.Operation != "read_file_type" || domainErr.Retryable {
+		t.Errorf("ReadFile 应明确拒绝非 Blob 对象：%v", readErr)
+	}
+}
+
 // installGitHelper 把当前测试二进制复制成临时 git 命令，并通过环境变量配置输出。
 // 使用 base64 是因为 Windows 环境变量不能安全携带 name-status 所需的 NUL 分隔符。
 func installGitHelper(t *testing.T, stdout, stderr []byte, exitCode int) {

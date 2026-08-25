@@ -17,6 +17,7 @@ import (
 	repositoryapp "github.com/reposense/reposense/internal/application/repository"
 	"github.com/reposense/reposense/internal/domain/common"
 	"github.com/reposense/reposense/internal/domain/repository"
+	"github.com/reposense/reposense/internal/ports"
 )
 
 type fakeGit struct {
@@ -315,6 +316,53 @@ func (*missingBaselineGit) Diff(context.Context, string, string, string) ([]repo
 }
 func (*missingBaselineGit) ReadFile(context.Context, string, string, string) ([]byte, error) {
 	return []byte("def current(): pass"), nil
+}
+
+// fixedParserRegistry 将指定解析器用于所有路径，便于精确观察大小限制前后是否调用 Parse。
+type fixedParserRegistry struct{ parser ports.LanguageParser }
+
+func (r fixedParserRegistry) ForPath(string) (ports.LanguageParser, bool) { return r.parser, true }
+
+type countingLanguageParser struct {
+	mu       sync.Mutex
+	calls    int
+	parseErr error
+}
+
+func (*countingLanguageParser) Language() string     { return "counting" }
+func (*countingLanguageParser) Extensions() []string { return []string{".test"} }
+func (*countingLanguageParser) Version() string      { return "counting@1" }
+func (p *countingLanguageParser) Parse(context.Context, string, repository.FileContent) (repository.ParsedFile, error) {
+	p.mu.Lock()
+	p.calls++
+	p.mu.Unlock()
+	return repository.ParsedFile{}, p.parseErr
+}
+func (p *countingLanguageParser) Calls() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
+// cancelingReadGit 在 ReadFile 内取消请求并返回真实读取错误，模拟超时与底层失败同时发生。
+type cancelingReadGit struct {
+	commit string
+	cancel context.CancelFunc
+	cause  error
+}
+
+func (g *cancelingReadGit) ResolveCommit(context.Context, string, string) (string, error) {
+	return g.commit, nil
+}
+func (*cancelingReadGit) ListFiles(context.Context, string, string) ([]string, error) {
+	return []string{"a.py"}, nil
+}
+func (*cancelingReadGit) Diff(context.Context, string, string, string) ([]repository.ChangedPath, error) {
+	return nil, nil
+}
+func (g *cancelingReadGit) ReadFile(context.Context, string, string, string) ([]byte, error) {
+	g.cancel()
+	return nil, g.cause
 }
 
 func TestServiceFullIncrementalAndIdempotent(t *testing.T) {
@@ -857,6 +905,160 @@ func TestServiceValidatesDeletedAndRenamedOldPaths(t *testing.T) {
 				t.Fatalf("不安全变更不应被持久化：saved=%v err=%v", saved, lookupErr)
 			}
 		})
+	}
+}
+
+// TestServiceEnforcesMaxFileBytesBeforeParser 验证大小边界使用严格的“超过”语义，
+// 等于上限的文件允许解析，超过一个字节则记录 too_large 且绝不调用 Parser。
+func TestServiceEnforcesMaxFileBytesBeforeParser(t *testing.T) {
+	sha := "1111111111111111111111111111111111111111"
+	tests := []struct {
+		name       string
+		content    []byte
+		wantCalls  int
+		wantReason string
+	}{
+		{name: "exact_limit", content: []byte("abcd"), wantCalls: 1},
+		{name: "one_byte_over", content: []byte("abcde"), wantCalls: 0, wantReason: "too_large"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			git := &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {"file.test": tt.content}}}
+			parser := &countingLanguageParser{}
+			service, err := repositoryapp.New(git, fixedParserRegistry{parser: parser}, memory.NewRepositoryStore(), recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.Config{MaxFiles: 10, MaxFileBytes: 4})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, syncErr := service.Sync(context.Background(), repository.SyncCommand{
+				Scope: common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}, RepositoryPath: "repo", Ref: "main", IdempotencyKey: "size-" + tt.name,
+			})
+			if syncErr != nil {
+				t.Fatal(syncErr)
+			}
+			if calls := parser.Calls(); calls != tt.wantCalls {
+				t.Fatalf("Parser 调用次数错误：got=%d want=%d", calls, tt.wantCalls)
+			}
+			if tt.wantReason == "" {
+				if len(result.SkippedFiles) != 0 {
+					t.Fatalf("边界内文件不应跳过：%#v", result.SkippedFiles)
+				}
+			} else if len(result.SkippedFiles) != 1 || result.SkippedFiles[0].Reason != tt.wantReason {
+				t.Fatalf("超限文件应记录原因：%#v", result.SkippedFiles)
+			}
+		})
+	}
+}
+
+// TestServiceSkipsBinaryBeforeParser 验证明确的二进制内容不会进入语言 Parser，
+// 同时在结果中保留 binary 原因，便于调用方区分“不支持”与“内容不是文本”。
+func TestServiceSkipsBinaryBeforeParser(t *testing.T) {
+	sha := "1111111111111111111111111111111111111111"
+	git := &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {"binary.test": {0x00, 0x01, 0x02}}}}
+	parser := &countingLanguageParser{}
+	service, err := repositoryapp.New(git, fixedParserRegistry{parser: parser}, memory.NewRepositoryStore(), recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, syncErr := service.Sync(context.Background(), repository.SyncCommand{
+		Scope: common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}, RepositoryPath: "repo", Ref: "main", IdempotencyKey: "binary",
+	})
+	if syncErr != nil {
+		t.Fatal(syncErr)
+	}
+	if parser.Calls() != 0 || len(result.SkippedFiles) != 1 || result.SkippedFiles[0].Reason != "binary" {
+		t.Fatalf("二进制文件应在 Parser 前跳过：calls=%d skipped=%#v", parser.Calls(), result.SkippedFiles)
+	}
+}
+
+// TestServicePersistsParserFailure 验证语言 Parser 的错误使用 PARSE_FAILURE 收口，
+// 保存脱敏后的失败 Job、Snapshot 和 parse.failed.v1 事件，并保留原始 cause 供内部诊断。
+func TestServicePersistsParserFailure(t *testing.T) {
+	sha := "1111111111111111111111111111111111111111"
+	cause := errors.New("语法树构造失败：内部细节")
+	git := &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {"broken.test": []byte("broken")}}}
+	parser := &countingLanguageParser{parseErr: cause}
+	store := memory.NewRepositoryStore()
+	service, err := repositoryapp.New(git, fixedParserRegistry{parser: parser}, store, recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}
+	key := "parser-failure"
+	result, syncErr := service.Sync(context.Background(), repository.SyncCommand{
+		Scope: scope, RepositoryPath: "repo", Ref: "main", IdempotencyKey: key,
+	})
+	if !repository.IsCode(syncErr, repository.ErrParseFailure) || !errors.Is(syncErr, cause) {
+		t.Fatalf("Parser 错误分类或 cause 丢失：%v", syncErr)
+	}
+	if result.Job.Status != repository.StatusFailed || result.Job.ErrorMessage != "仓库解析失败" || result.Snapshot.SyncStatus != repository.StatusFailed {
+		t.Fatalf("Parser 失败状态未脱敏或不完整：%#v %#v", result.Job, result.Snapshot)
+	}
+	cached, found, lookupErr := store.FindByIdempotencyKey(context.Background(), scope, key)
+	if lookupErr != nil || !found || cached.Event.EventType != "parse.failed.v1" || cached.Job.ErrorCode != string(repository.ErrParseFailure) {
+		t.Fatalf("Parser 失败现场未持久化：found=%v result=%#v err=%v", found, cached, lookupErr)
+	}
+}
+
+// TestServiceRecordsUnsupportedFilesWithoutReading 验证当前 MVP 对未支持语言并非无声丢弃：
+// 它应在 SkippedFiles 和完成事件中留下明确记录，同时避免无意义的 Git Blob 读取。
+func TestServiceRecordsUnsupportedFilesWithoutReading(t *testing.T) {
+	sha := "1111111111111111111111111111111111111111"
+	git := &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {
+		"main.go": []byte("package main"), "lib.rs": []byte("fn main() {}"),
+	}}}
+	publisher := &collectingPublisher{}
+	service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), memory.NewRepositoryStore(), publisher, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, syncErr := service.Sync(context.Background(), repository.SyncCommand{
+		Scope: common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}, RepositoryPath: "repo", Ref: "main", IdempotencyKey: "unsupported",
+	})
+	if syncErr != nil {
+		t.Fatal(syncErr)
+	}
+	if len(result.SkippedFiles) != 2 || result.SkippedFiles[0].Path != "lib.rs" || result.SkippedFiles[1].Path != "main.go" {
+		t.Fatalf("未支持文件记录不完整：%#v", result.SkippedFiles)
+	}
+	for _, skipped := range result.SkippedFiles {
+		if skipped.Reason != "unsupported" {
+			t.Fatalf("未支持文件原因错误：%#v", skipped)
+		}
+	}
+	if git.ReadCount() != 0 {
+		t.Fatalf("未支持文件不应读取 Blob，reads=%d", git.ReadCount())
+	}
+	events := publisher.Events()
+	if len(events) != 1 || events[0].Payload["skipped_count"] != 2 {
+		t.Fatalf("完成事件应包含跳过数量：%#v", events)
+	}
+}
+
+// TestServicePersistsOriginalFailureAfterContextCancellation 验证业务 Context 已取消时，
+// 失败现场使用独立且有界的清理 Context 保存，最终仍返回最初的 Git 错误而不是 save_failure。
+func TestServicePersistsOriginalFailureAfterContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cause := errors.New("读取 Git Blob 失败")
+	git := &cancelingReadGit{commit: "1111111111111111111111111111111111111111", cancel: cancel, cause: cause}
+	store := memory.NewRepositoryStore()
+	service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), store, recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}
+	key := "cancel-during-read"
+	result, syncErr := service.Sync(ctx, repository.SyncCommand{
+		Scope: scope, RepositoryPath: "repo", Ref: "main", IdempotencyKey: key,
+	})
+	if !repository.IsCode(syncErr, repository.ErrGitFailure) || !errors.Is(syncErr, cause) {
+		t.Fatalf("取消后的失败保存不应覆盖原始 Git 错误：%v", syncErr)
+	}
+	if result.Job.Status != repository.StatusFailed || result.Snapshot.SyncStatus != repository.StatusFailed {
+		t.Fatalf("失败状态不完整：job=%s snapshot=%s", result.Job.Status, result.Snapshot.SyncStatus)
+	}
+	cached, found, lookupErr := store.FindByIdempotencyKey(context.Background(), scope, key)
+	if lookupErr != nil || !found || cached.Event.EventType != "parse.failed.v1" || cached.Job.ErrorCode != string(repository.ErrGitFailure) {
+		t.Fatalf("取消后仍应保存原始失败现场：found=%v result=%#v err=%v", found, cached, lookupErr)
 	}
 }
 

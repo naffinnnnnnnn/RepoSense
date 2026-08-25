@@ -56,6 +56,38 @@ func TestTextParserExtractsPackageDependencies(t *testing.T) {
 	}
 }
 
+// TestDefaultRegistryDocumentsSupportedAndUnsupportedPaths 固化 MVP 当前真实解析范围：
+// 已支持路径必须正确路由且大小写不敏感，未支持语言必须明确返回 unsupported。
+func TestDefaultRegistryDocumentsSupportedAndUnsupportedPaths(t *testing.T) {
+	registry := DefaultRegistry()
+	tests := []struct {
+		path         string
+		wantLanguage string
+		supported    bool
+	}{
+		{path: "src/service.PY", wantLanguage: "python", supported: true},
+		{path: "web/component.TSX", wantLanguage: "typescript", supported: true},
+		{path: "src/Main.JAVA", wantLanguage: "java", supported: true},
+		{path: "README.MD", wantLanguage: "text", supported: true},
+		{path: "Dockerfile", wantLanguage: "text", supported: true},
+		{path: "go.mod", wantLanguage: "text", supported: true},
+		{path: "main.go", supported: false},
+		{path: "lib.rs", supported: false},
+		{path: "service.cs", supported: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			parser, supported := registry.ForPath(tt.path)
+			if supported != tt.supported {
+				t.Fatalf("解析器支持状态不符：supported=%v want=%v", supported, tt.supported)
+			}
+			if supported && parser.Language() != tt.wantLanguage {
+				t.Fatalf("解析器路由错误：got=%s want=%s", parser.Language(), tt.wantLanguage)
+			}
+		})
+	}
+}
+
 func assertArtifact(t *testing.T, parsed repository.ParsedFile, kind repository.ArtifactKind, name string, start, end int) {
 	t.Helper()
 	for _, item := range parsed.Artifacts {

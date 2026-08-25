@@ -1,6 +1,7 @@
 package repositoryapp
 
 import (
+	"bytes"
 	"reflect"
 	"testing"
 
@@ -91,5 +92,27 @@ func TestFilterChangesReturnsIndependentSliceWithoutPatterns(t *testing.T) {
 	filtered[0].Path = "mutated.go"
 	if changes[0].Path != "z.go" {
 		t.Fatalf("过滤结果与输入共享底层数组，原始 Git 变更被修改为：%#v", changes)
+	}
+}
+
+// TestIsBinaryHandlesSampleBoundary 验证 8000 字节采样边界不会漏掉紧邻边界的二进制标记，
+// 也不会因为恰好截断一个合法 UTF-8 多字节字符而把文本误判成二进制。
+func TestIsBinaryHandlesSampleBoundary(t *testing.T) {
+	tests := []struct {
+		name    string
+		content []byte
+		want    bool
+	}{
+		{name: "nul_after_sample", content: append(bytes.Repeat([]byte{'a'}, 8000), 0), want: true},
+		{name: "invalid_utf8_after_sample", content: append(bytes.Repeat([]byte{'a'}, 8000), 0xff), want: true},
+		{name: "utf8_rune_split_by_sample", content: append(bytes.Repeat([]byte{'a'}, 7999), []byte("中")...), want: false},
+		{name: "ordinary_utf8_text", content: []byte("合法的 UTF-8 文本\n"), want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isBinary(tt.content); got != tt.want {
+				t.Fatalf("二进制识别结果错误：got=%v want=%v", got, tt.want)
+			}
+		})
 	}
 }
