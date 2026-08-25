@@ -40,14 +40,15 @@ type ChangedPath struct {
 	Kind    ChangeKind `json:"kind"`
 }
 
+// SyncCommand 输入:SyncCommand
 type SyncCommand struct {
-	Scope          common.Scope `json:"scope"`
-	RepositoryPath string       `json:"repository_path"`
-	Provider       string       `json:"provider"`
-	Ref            string       `json:"ref"`
-	CredentialsRef string       `json:"credentials_ref,omitempty"`
-	IncludePaths   []string     `json:"include_paths,omitempty"`
-	IdempotencyKey string       `json:"idempotency_key"`
+	Scope          common.Scope `json:"scope"`                     // 租户、仓库、快照和Trace隔离信息
+	RepositoryPath string       `json:"repository_path"`           // Git仓库路径(目前只支持本地)
+	Provider       string       `json:"provider"`                  // 限制Provide为本地
+	Ref            string       `json:"ref"`                       // 分支
+	CredentialsRef string       `json:"credentials_ref,omitempty"` //
+	IncludePaths   []string     `json:"include_paths,omitempty"`   // 限制需要解析的目录
+	IdempotencyKey string       `json:"idempotency_key"`           // 防止同一个请求重复还行
 }
 
 func (c SyncCommand) Validate() error {
@@ -66,6 +67,7 @@ func (c SyncCommand) Validate() error {
 	return nil
 }
 
+// Snapshot 快照
 type Snapshot struct {
 	common.EntityMeta
 	SnapshotID       string        `json:"snapshot_id"`
@@ -80,6 +82,7 @@ type Snapshot struct {
 	RetryCount       int           `json:"retry_count"`
 }
 
+// ParseJob 解析任务
 type ParseJob struct {
 	common.EntityMeta
 	JobID         string     `json:"job_id"`

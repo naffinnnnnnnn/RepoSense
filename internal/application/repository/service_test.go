@@ -147,6 +147,36 @@ func TestServiceRejectsUnsafeIncludePattern(t *testing.T) {
 	}
 }
 
+// TestServiceRejectsMissingTraceIDBeforeDependencies 验证直接调用 Service 时也必须提供
+// 可用于串联 Snapshot、事件和日志的 TraceID，并且应在访问 Git 或 Store 前拒绝无效命令。
+func TestServiceRejectsMissingTraceIDBeforeDependencies(t *testing.T) {
+	for _, traceID := range []string{"", "   "} {
+		name := "empty"
+		if traceID != "" {
+			name = "whitespace"
+		}
+		t.Run(name, func(t *testing.T) {
+			git := &fakeGit{}
+			service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), memory.NewRepositoryStore(), recordingPublisher{}, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = service.Sync(context.Background(), repository.SyncCommand{
+				Scope:          common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: traceID},
+				RepositoryPath: "ignored",
+				Ref:            "main",
+				IdempotencyKey: "trace-required",
+			})
+			if !repository.IsCode(err, repository.ErrInvalidInput) {
+				t.Fatalf("缺失 TraceID 应返回 INVALID_INPUT，实际为：%v", err)
+			}
+			if git.resolves != 0 {
+				t.Fatalf("TraceID 校验失败后不应访问 Git，ResolveCommit 调用次数为：%d", git.resolves)
+			}
+		})
+	}
+}
+
 // TestServiceDoesNotReuseMutableRefResultAfterRefMoves 验证 CLI 风格幂等键不会把移动后的 ref 映射到旧 commit。
 func TestServiceDoesNotReuseMutableRefResultAfterRefMoves(t *testing.T) {
 	sha1 := "1111111111111111111111111111111111111111"

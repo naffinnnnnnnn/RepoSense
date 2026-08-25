@@ -162,7 +162,7 @@ func (s *Service) Sync(ctx context.Context, cmd repository.SyncCommand) (result 
 	result = repository.ParseResult{Snapshot: snapshot, Job: job, Artifacts: []repository.CodeArtifact{}, Relations: []repository.CodeRelation{}}
 	// 逐个处理变更文件
 	for index, change := range changes {
-		// 文件已产出
+		// 文件已删除
 		if change.Kind == repository.ChangeDeleted {
 			result.DeletedPaths = append(result.DeletedPaths, change.Path)
 			continue

@@ -1,6 +1,7 @@
 package repositoryapp
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/reposense/reposense/internal/domain/repository"
@@ -33,5 +34,48 @@ func TestValidatePatternsAllowsOrdinaryDoubleDots(t *testing.T) {
 	}
 	if err := validatePatterns([]string{"src/../secret/**"}); err == nil {
 		t.Fatal("不应接受包含父目录穿越的路径")
+	}
+}
+
+// TestFilterChangesNormalizesWindowsStylePatterns 验证调用方使用 Windows 路径分隔符时，
+// IncludePaths 与仓库内部统一使用正斜杠的路径具有相同匹配语义。
+func TestFilterChangesNormalizesWindowsStylePatterns(t *testing.T) {
+	changes := []repository.ChangedPath{
+		{Path: "src/root.py", Kind: repository.ChangeAdded},
+		{Path: "src/service/nested.py", Kind: repository.ChangeModified},
+		{Path: "docs/readme.md", Kind: repository.ChangeModified},
+	}
+	want := filterChanges(changes, []string{"src/**"})
+	got := filterChanges(changes, []string{`src\**`})
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Windows 风格 pattern 应与正斜杠 pattern 等价：got=%#v want=%#v", got, want)
+	}
+}
+
+// TestFilterChangesTreatsDoubleStarAsRecursiveGlob 验证 ** 表示任意目录深度，
+// 而不是只匹配恰好一层子目录。
+func TestFilterChangesTreatsDoubleStarAsRecursiveGlob(t *testing.T) {
+	changes := []repository.ChangedPath{
+		{Path: "src/root.go", Kind: repository.ChangeAdded},
+		{Path: "src/service/one.go", Kind: repository.ChangeAdded},
+		{Path: "src/service/internal/deep.go", Kind: repository.ChangeAdded},
+		{Path: "src/service/readme.md", Kind: repository.ChangeAdded},
+	}
+	got := filterChanges(changes, []string{"src/**/*.go"})
+	want := []repository.ChangedPath{changes[0], changes[1], changes[2]}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("递归 Glob 应匹配直接及任意层级的 Go 文件：got=%#v want=%#v", got, want)
+	}
+}
+
+// TestValidatePatternsRejectsWindowsAbsolutePaths 验证 IncludePaths 始终是仓库相对 Glob，
+// Windows 盘符和 UNC 路径不能绕过只检查前导正斜杠的绝对路径校验。
+func TestValidatePatternsRejectsWindowsAbsolutePaths(t *testing.T) {
+	for _, pattern := range []string{`C:\repo\src\**`, `\\server\share\src\**`} {
+		t.Run(pattern, func(t *testing.T) {
+			if err := validatePatterns([]string{pattern}); err == nil {
+				t.Fatalf("不应接受 Windows 绝对 IncludePath：%q", pattern)
+			}
+		})
 	}
 }
