@@ -166,6 +166,56 @@ paths:
         '400': { description: 输入无效 }
         '404': { description: 仓库或 ref 不存在 }
         '409': { description: 幂等键或版本冲突 }
+  /v1/repositories/{repository_id}/jobs/{job_id}:
+    get:
+      summary: 查询仓库解析任务状态和进度
+      parameters:
+        - { in: path, name: repository_id, required: true, schema: { type: string } }
+        - { in: path, name: job_id, required: true, schema: { type: string } }
+      responses:
+        '200': { description: 解析任务, content: { application/json: { schema: { $ref: '#/components/schemas/ParseJob' } } } }
+        '404': { description: 任务不存在 }
+  /v1/repositories/{repository_id}/jobs/{job_id}/cancel:
+    post:
+      summary: 取消等待中或运行中的解析任务
+      parameters:
+        - { in: path, name: repository_id, required: true, schema: { type: string } }
+        - { in: path, name: job_id, required: true, schema: { type: string } }
+      responses:
+        '204': { description: 已请求取消 }
+        '404': { description: 任务不存在 }
+        '409': { description: 任务当前状态不可取消 }
+  /v1/repositories/{repository_id}/jobs/{job_id}/retry:
+    post:
+      summary: 为可重试失败创建新 attempt
+      parameters:
+        - { in: path, name: repository_id, required: true, schema: { type: string } }
+        - { in: path, name: job_id, required: true, schema: { type: string } }
+      responses:
+        '202': { description: 重试任务已接受, content: { application/json: { schema: { $ref: '#/components/schemas/ParseJob' } } } }
+        '404': { description: 任务不存在 }
+        '409': { description: 任务不可重试或已被重试 }
+  /v1/repositories/{repository_id}/snapshots/{snapshot_id}:
+    get:
+      summary: 查询仓库解析快照
+      parameters:
+        - { in: path, name: repository_id, required: true, schema: { type: string } }
+        - { in: path, name: snapshot_id, required: true, schema: { type: string } }
+      responses:
+        '200': { description: 解析快照, content: { application/json: { schema: { $ref: '#/components/schemas/RepositorySnapshot' } } } }
+        '404': { description: 快照不存在 }
+  /v1/repositories/{repository_id}/snapshots/{snapshot_id}/artifacts:
+    get:
+      summary: 分页查询成功快照的 Code IR Artifact
+      parameters:
+        - { in: path, name: repository_id, required: true, schema: { type: string } }
+        - { in: path, name: snapshot_id, required: true, schema: { type: string } }
+        - { in: query, name: cursor, schema: { type: string } }
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 1000, default: 100 } }
+      responses:
+        '200': { description: Artifact 分页结果, content: { application/json: { schema: { $ref: '#/components/schemas/ArtifactPage' } } } }
+        '404': { description: 快照不存在 }
+        '409': { description: 快照尚未成功 }
 components:
   schemas:
     AgentAskCommand:
@@ -502,17 +552,54 @@ components:
         sources: { type: array, items: { $ref: '#/components/schemas/SourceRef' } }
     RepositorySyncCommand:
       type: object
-      required: [tenant_id, ref]
+      required: [ref]
+      oneOf:
+        - required: [repository_path]
+        - required: [repository_url]
       properties:
-        tenant_id: { type: string, minLength: 1 }
+        repository_path: { type: string, minLength: 1 }
+        repository_url: { type: string, format: uri }
+        provider: { enum: [local, git, github, gitlab] }
         ref: { type: string, minLength: 1 }
+        credentials_ref: { type: string, minLength: 1 }
         include_paths: { type: array, items: { type: string } }
+      additionalProperties: false
     ParseJob:
       type: object
-      required: [job_id, snapshot_id, status, scope, progress]
+      required: [job_id, snapshot_id, status, job_status, scope, progress, parser_version, tenant_id, repository_id, trace_id]
       properties:
         job_id: { type: string }
         snapshot_id: { type: string }
         status: { enum: [PENDING, RUNNING, SUCCEEDED, FAILED, CANCELLED] }
+        job_status: { enum: [PENDING, RUNNING, SUCCEEDED, FAILED, CANCELLED] }
         scope: { enum: [FULL, INCREMENTAL] }
         progress: { type: integer, minimum: 0, maximum: 100 }
+        parser_version: { type: string }
+        tenant_id: { type: string }
+        repository_id: { type: string }
+        trace_id: { type: string }
+        error_code: { type: string }
+        error_message: { type: string }
+        retry_count: { type: integer, minimum: 0 }
+    RepositorySnapshot:
+      type: object
+      required: [snapshot_id, provider, ref, commit_sha, sync_status, changed_paths, tenant_id, repository_id, trace_id]
+      properties:
+        snapshot_id: { type: string }
+        provider: { type: string }
+        ref: { type: string }
+        commit_sha: { type: string }
+        parent_snapshot_id: { type: string }
+        sync_status: { enum: [PENDING, RUNNING, SUCCEEDED, FAILED, CANCELLED] }
+        changed_paths: { type: array, items: { type: object } }
+        tenant_id: { type: string }
+        repository_id: { type: string }
+        trace_id: { type: string }
+        error_code: { type: string }
+        error_message: { type: string }
+    ArtifactPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { type: object } }
+        next_cursor: { type: string }

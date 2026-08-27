@@ -4,4 +4,4 @@ DROP TABLE IF EXISTS code_relations;
 DROP TABLE IF EXISTS code_artifacts;
 DROP TABLE IF EXISTS parse_jobs;
 DROP TABLE IF EXISTS repository_snapshots;
-
+DROP TABLE IF EXISTS repositories;

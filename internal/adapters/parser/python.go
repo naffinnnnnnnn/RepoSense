@@ -2,6 +2,7 @@ package parser
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -19,13 +20,23 @@ type Python struct{}
 func NewPython() *Python             { return &Python{} }
 func (*Python) Language() string     { return "python" }
 func (*Python) Extensions() []string { return []string{".py"} }
-func (*Python) Version() string      { return "python-structural@1.0.0" }
+func (*Python) Version() string      { return "python-structural@2.0.0" }
 
 func (*Python) Parse(ctx context.Context, commit string, file repository.FileContent) (repository.ParsedFile, error) {
+	clean, err := repository.CanonicalPath(file.Path)
+	if err != nil {
+		return repository.ParsedFile{}, err
+	}
+	file.Path = clean
 	result := repository.ParsedFile{}
 	root := fileArtifact(commit, file, "python", repository.ArtifactFile)
 	result.Artifacts = append(result.Artifacts, root)
 	lines := strings.Split(string(file.Content), "\n")
+	declarations, continuation, err := pythonDeclarations(lines)
+	if err != nil {
+		return repository.ParsedFile{}, err
+	}
+	symbols := map[string]string{}
 	type frame struct {
 		indent   int
 		name, id string
@@ -36,7 +47,14 @@ func (*Python) Parse(ctx context.Context, commit string, file repository.FileCon
 		if err := ctx.Err(); err != nil {
 			return repository.ParsedFile{}, err
 		}
+		if continuation[i] {
+			continue
+		}
 		lineNo := i + 1
+		declaration := raw
+		if joined := declarations[i]; joined != "" {
+			declaration = joined
+		}
 		trimmed := strings.TrimSpace(raw)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
@@ -46,10 +64,11 @@ func (*Python) Parse(ctx context.Context, commit string, file repository.FileCon
 			stack = stack[:len(stack)-1]
 		}
 		parent := stack[len(stack)-1]
-		if match := pyClass.FindStringSubmatch(raw); match != nil {
+		if match := pyClass.FindStringSubmatch(declaration); match != nil {
 			qualified := qualify(parent.name, match[1])
 			a := artifact(commit, file.Path, "python", repository.ArtifactClass, match[1], qualified, strings.TrimSpace(raw), lineNo, lineNo, raw, nil)
 			result.Artifacts = append(result.Artifacts, a)
+			symbols[qualified] = a.ArtifactID
 			result.Relations = append(result.Relations, relation(commit, file.Path, repository.RelationContains, parent.id, a.ArtifactID, lineNo, raw, 1))
 			for _, base := range splitNames(match[2]) {
 				result.Relations = append(result.Relations, relation(commit, file.Path, repository.RelationExtends, a.ArtifactID, "symbol:"+base, lineNo, raw, .9))
@@ -57,7 +76,7 @@ func (*Python) Parse(ctx context.Context, commit string, file repository.FileCon
 			stack = append(stack, frame{indent, qualified, a.ArtifactID, repository.ArtifactClass})
 			continue
 		}
-		if match := pyFunc.FindStringSubmatch(raw); match != nil {
+		if match := pyFunc.FindStringSubmatch(declaration); match != nil {
 			kind := repository.ArtifactFunction
 			if parent.kind == repository.ArtifactClass {
 				kind = repository.ArtifactMethod
@@ -67,8 +86,9 @@ func (*Python) Parse(ctx context.Context, commit string, file repository.FileCon
 			if strings.TrimSpace(match[1]) != "" {
 				attrs["async"] = "true"
 			}
-			a := artifact(commit, file.Path, "python", kind, match[2], qualified, match[2]+match[3], lineNo, lineNo, raw, attrs)
+			a := artifact(commit, file.Path, "python", kind, match[2], qualified, match[2]+match[3], lineNo, lineNo, declaration, attrs)
 			result.Artifacts = append(result.Artifacts, a)
+			symbols[qualified] = a.ArtifactID
 			result.Relations = append(result.Relations, relation(commit, file.Path, repository.RelationContains, parent.id, a.ArtifactID, lineNo, raw, 1))
 			stack = append(stack, frame{indent, qualified, a.ArtifactID, kind})
 			continue
@@ -88,12 +108,46 @@ func (*Python) Parse(ctx context.Context, commit string, file repository.FileCon
 				if isCallKeyword(name) {
 					continue
 				}
-				result.Relations = append(result.Relations, relation(commit, file.Path, repository.RelationCalls, parent.id, "symbol:"+name, lineNo, raw, .65))
+				target := "symbol:" + name
+				if strings.HasPrefix(name, "self.") && parent.kind == repository.ArtifactMethod {
+					className := parent.name[:strings.LastIndex(parent.name, ".")]
+					if id := symbols[className+"."+strings.TrimPrefix(name, "self.")]; id != "" {
+						target = id
+					}
+				}
+				result.Relations = append(result.Relations, relation(commit, file.Path, repository.RelationCalls, parent.id, target, lineNo, raw, .65))
 			}
 		}
 	}
 	finalizePythonRanges(result.Artifacts, lines)
 	return result, nil
+}
+
+func pythonDeclarations(lines []string) (map[int]string, map[int]bool, error) {
+	result := map[int]string{}
+	continuation := map[int]bool{}
+	for i := 0; i < len(lines); i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if !strings.HasPrefix(trimmed, "def ") && !strings.HasPrefix(trimmed, "async def ") && !strings.HasPrefix(trimmed, "class ") {
+			continue
+		}
+		joined := strings.TrimSpace(lines[i])
+		depth := strings.Count(joined, "(") - strings.Count(joined, ")")
+		end := i
+		for (depth > 0 || !strings.HasSuffix(strings.TrimSpace(joined), ":")) && end+1 < len(lines) {
+			end++
+			continuation[end] = true
+			part := strings.TrimSpace(lines[end])
+			joined += " " + part
+			depth += strings.Count(part, "(") - strings.Count(part, ")")
+		}
+		if depth != 0 || (!pyFunc.MatchString(joined) && !pyClass.MatchString(joined)) {
+			return nil, nil, fmt.Errorf("Python 声明语法无效（第 %d 行）", i+1)
+		}
+		result[i] = joined
+		i = end
+	}
+	return result, continuation, nil
 }
 
 func qualify(parent, name string) string {

@@ -113,20 +113,16 @@ func (a *PatchApplier) git(ctx context.Context, stdin []byte, args ...string) ([
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
 	var stdout, stderr cappedBuffer
-	stdout.limit, stderr.limit = maxGitOutput, 4096
+	stdout.limit, stderr.limit = defaultMaxGitOutput, 4096
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		message := strings.TrimSpace(stderr.String())
-		if len(message) > 1024 {
-			message = message[:1024]
-		}
-		return nil, fmt.Errorf("git patch command failed: %s", message)
+		return nil, fmt.Errorf("git patch command failed")
 	}
 	if stdout.exceeded {
-		return nil, fmt.Errorf("git output exceeds %d bytes", maxGitOutput)
+		return nil, fmt.Errorf("git output exceeds %d bytes", defaultMaxGitOutput)
 	}
 	return stdout.Bytes(), nil
 }

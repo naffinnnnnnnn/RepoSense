@@ -3,7 +3,6 @@ package parser
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -26,12 +25,24 @@ func digest(parts ...string) string {
 func stableID(prefix string, parts ...string) string { return prefix + "_" + digest(parts...)[:24] }
 
 func sourceRef(commit, path string, start, end int, content string) common.SourceRef {
+	clean, err := repository.CanonicalPath(path)
+	if err == nil {
+		path = clean
+	}
 	return common.SourceRef{CommitSHA: commit, Path: filepath.ToSlash(path), StartLine: start, EndLine: end,
 		ContentHash: "sha256:" + digest(content)}
 }
 
 func artifact(commit, path, language string, kind repository.ArtifactKind, name, qualified, signature string, start, end int, content string, attrs map[string]string) repository.CodeArtifact {
-	id := stableID("art", path, string(kind), qualified)
+	clean, err := repository.CanonicalPath(path)
+	if err == nil {
+		path = clean
+	}
+	identitySignature := ""
+	if kind == repository.ArtifactMethod || kind == repository.ArtifactFunction {
+		identitySignature = strings.Join(strings.Fields(signature), " ")
+	}
+	id := stableID("art", path, string(kind), qualified, identitySignature)
 	ref := sourceRef(commit, path, start, end, content)
 	ref.SymbolID = id
 	return repository.CodeArtifact{ArtifactID: id, Kind: kind, Name: name, QualifiedName: qualified,
@@ -39,7 +50,11 @@ func artifact(commit, path, language string, kind repository.ArtifactKind, name,
 }
 
 func relation(commit, path string, kind repository.RelationKind, from, to string, line int, evidence string, confidence float64) repository.CodeRelation {
-	return repository.CodeRelation{RelationID: stableID("rel", path, string(kind), from, to, fmt.Sprint(line)), Kind: kind,
+	clean, err := repository.CanonicalPath(path)
+	if err == nil {
+		path = clean
+	}
+	return repository.CodeRelation{RelationID: stableID("rel", path, string(kind), from, to), Kind: kind,
 		From: from, To: to, Evidence: sourceRef(commit, path, line, line, evidence), Confidence: confidence}
 }
 

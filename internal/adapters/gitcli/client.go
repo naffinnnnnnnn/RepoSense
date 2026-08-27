@@ -14,13 +14,20 @@ import (
 )
 
 // Git输出上限
-const maxGitOutput = 64 << 20
+const defaultMaxGitOutput = 64 << 20
 
 // Client 无状态Git客户端
-type Client struct{}
+type Client struct{ maxOutput int }
 
 // New 构造函数
-func New() *Client { return &Client{} }
+func New() *Client { return &Client{maxOutput: defaultMaxGitOutput} }
+
+func NewWithOutputLimit(limit int) (*Client, error) {
+	if limit <= 0 {
+		return nil, errors.New("Git 输出限制必须为正数")
+	}
+	return &Client{maxOutput: limit}, nil
+}
 
 func (c *Client) ResolveCommit(ctx context.Context, repoPath, ref string) (string, error) {
 	if strings.TrimSpace(ref) == "" || strings.HasPrefix(ref, "-") {
@@ -28,7 +35,7 @@ func (c *Client) ResolveCommit(ctx context.Context, repoPath, ref string) (strin
 	}
 	out, err := c.run(ctx, repoPath, "rev-parse", "--verify", ref+"^{commit}")
 	if err != nil {
-		return "", &repository.DomainError{Code: repository.ErrRefNotFound, Operation: "resolve", Message: "无法解析 Git ref", Cause: err}
+		return "", classify(err, "resolve", true)
 	}
 	sha := strings.TrimSpace(string(out))
 	if len(sha) != 40 && len(sha) != 64 {
@@ -38,11 +45,22 @@ func (c *Client) ResolveCommit(ctx context.Context, repoPath, ref string) (strin
 }
 
 func (c *Client) ListFiles(ctx context.Context, repoPath, commit string) ([]string, error) {
-	out, err := c.run(ctx, repoPath, "ls-tree", "-r", "-z", "--name-only", commit)
+	out, err := c.run(ctx, repoPath, "ls-tree", "-r", "-z", "--format=%(objecttype) %(path)", commit)
 	if err != nil {
-		return nil, gitFailure("list_files", err)
+		return nil, classify(err, "list_files", true)
 	}
-	return splitZero(out), nil
+	entries := splitZero(out)
+	files := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		kind, name, ok := strings.Cut(entry, " ")
+		if !ok {
+			return nil, gitFailure("list_files", errors.New("ls-tree 输出格式错误"))
+		}
+		if kind == "blob" {
+			files = append(files, name)
+		}
+	}
+	return files, nil
 }
 
 func (c *Client) Diff(ctx context.Context, repoPath, from, to string) ([]repository.ChangedPath, error) {
@@ -51,7 +69,7 @@ func (c *Client) Diff(ctx context.Context, repoPath, from, to string) ([]reposit
 	}
 	out, err := c.run(ctx, repoPath, "diff", "--name-status", "-z", "--find-renames", from, to)
 	if err != nil {
-		return nil, gitFailure("diff", err)
+		return nil, classify(err, "diff", true)
 	}
 	parts := splitZero(out)
 	changes := make([]repository.ChangedPath, 0, len(parts)/2)
@@ -69,16 +87,24 @@ func (c *Client) Diff(ctx context.Context, repoPath, from, to string) ([]reposit
 			kind = repository.ChangeDeleted
 		case 'R':
 			kind = repository.ChangeRenamed
-		case 'M', 'T':
+		case 'C':
+			kind = repository.ChangeCopied
+		case 'M':
 			kind = repository.ChangeModified
+		case 'T':
+			kind = repository.ChangeTypeChanged
 		default:
-			continue
+			return nil, gitFailure("diff", fmt.Errorf("未知 Git 变更状态 %q", status))
 		}
-		if kind == repository.ChangeRenamed {
+		if kind == repository.ChangeRenamed || kind == repository.ChangeCopied {
 			if i+1 >= len(parts) {
 				return nil, gitFailure("diff", errors.New("重命名输出格式错误"))
 			}
-			changes = append(changes, repository.ChangedPath{OldPath: parts[i], Path: parts[i+1], Kind: kind})
+			if kind == repository.ChangeCopied {
+				changes = append(changes, repository.ChangedPath{Path: parts[i+1], Kind: repository.ChangeAdded})
+			} else {
+				changes = append(changes, repository.ChangedPath{OldPath: parts[i], Path: parts[i+1], Kind: kind})
+			}
 			i += 2
 		} else {
 			changes = append(changes, repository.ChangedPath{Path: parts[i], Kind: kind})
@@ -93,9 +119,16 @@ func (c *Client) ReadFile(ctx context.Context, repoPath, commit, path string) ([
 	if err != nil {
 		return nil, invalid("read_file", err.Error(), err)
 	}
+	typeOut, err := c.run(ctx, repoPath, "cat-file", "-t", commit+":"+clean)
+	if err != nil {
+		return nil, classify(err, "read_file_type", true)
+	}
+	if strings.TrimSpace(string(typeOut)) != "blob" {
+		return nil, &repository.DomainError{Code: repository.ErrGitFailure, Operation: "read_file_type", Message: "Git 对象不是 Blob", Retryable: false}
+	}
 	out, err := c.run(ctx, repoPath, "show", commit+":"+clean)
 	if err != nil {
-		return nil, gitFailure("read_file", err)
+		return nil, classify(err, "read_file", true)
 	}
 	return out, nil
 }
@@ -111,7 +144,11 @@ func (c *Client) run(ctx context.Context, repoPath string, args ...string) ([]by
 	}
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-c", "core.quotepath=false", "-C", abs}, args...)...)
 	var stdout cappedBuffer
-	stdout.limit = maxGitOutput
+	limit := c.maxOutput
+	if limit <= 0 {
+		limit = defaultMaxGitOutput
+	}
+	stdout.limit = limit
 	var stderr cappedBuffer
 	stderr.limit = 4096
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -123,10 +160,10 @@ func (c *Client) run(ctx context.Context, repoPath string, args ...string) ([]by
 		if len(message) > 1024 {
 			message = message[:1024]
 		}
-		return nil, fmt.Errorf("Git 命令执行失败：%s", message)
+		return nil, &commandError{cause: err, stderr: message}
 	}
 	if stdout.exceeded {
-		return nil, fmt.Errorf("Git 输出超过 %d 字节限制", maxGitOutput)
+		return nil, &outputLimitError{limit: limit}
 	}
 	return stdout.Bytes(), nil
 }
@@ -170,5 +207,46 @@ func invalid(op, message string, cause error) error {
 	return &repository.DomainError{Code: repository.ErrInvalidInput, Operation: op, Message: message, Cause: cause}
 }
 func gitFailure(op string, cause error) error {
-	return &repository.DomainError{Code: repository.ErrGitFailure, Operation: op, Message: "Git 仓库操作失败", Retryable: true, Cause: cause}
+	retryable := true
+	var limit *outputLimitError
+	if errors.As(cause, &limit) || strings.Contains(cause.Error(), "输出超过") {
+		retryable = false
+	}
+	return &repository.DomainError{Code: repository.ErrGitFailure, Operation: op, Message: "Git 仓库操作失败", Retryable: retryable, Cause: cause}
+}
+
+type commandError struct {
+	cause  error
+	stderr string
+}
+
+func (e *commandError) Error() string { return "Git 命令执行失败" }
+func (e *commandError) Unwrap() error { return e.cause }
+
+type outputLimitError struct{ limit int }
+
+func (e *outputLimitError) Error() string {
+	return fmt.Sprintf("Git 输出超过 %d 字节限制", e.limit)
+}
+
+func classify(err error, operation string, refSensitive bool) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	var domain *repository.DomainError
+	if errors.As(err, &domain) {
+		return err
+	}
+	var executable *exec.Error
+	if errors.As(err, &executable) {
+		return &repository.DomainError{Code: repository.ErrGitFailure, Operation: "git_cli_missing", Message: "Git CLI 不可用", Retryable: false, Cause: err}
+	}
+	var command *commandError
+	if refSensitive && errors.As(err, &command) {
+		lower := strings.ToLower(command.stderr)
+		if strings.Contains(lower, "bad object") || strings.Contains(lower, "unknown revision") || strings.Contains(lower, "not a valid object") || strings.Contains(lower, "needed a single revision") || strings.Contains(lower, "ambiguous argument") {
+			return &repository.DomainError{Code: repository.ErrRefNotFound, Operation: operation, Message: "Git ref 或 commit 不存在", Retryable: false, Cause: err}
+		}
+	}
+	return gitFailure(operation, err)
 }
