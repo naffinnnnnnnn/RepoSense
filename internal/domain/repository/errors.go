@@ -24,6 +24,13 @@ type DomainError struct {
 	Cause     error
 }
 
+type FailureDescriptor struct {
+	Code      ErrorCode
+	Operation string
+	Message   string
+	Retryable bool
+}
+
 func (e *DomainError) Error() string {
 	return fmt.Sprintf("%s: %s", e.Code, e.Message)
 }

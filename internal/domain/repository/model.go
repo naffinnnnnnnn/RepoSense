@@ -28,10 +28,12 @@ const (
 type ChangeKind string
 
 const (
-	ChangeAdded    ChangeKind = "ADDED"
-	ChangeModified ChangeKind = "MODIFIED"
-	ChangeDeleted  ChangeKind = "DELETED"
-	ChangeRenamed  ChangeKind = "RENAMED"
+	ChangeAdded       ChangeKind = "ADDED"
+	ChangeModified    ChangeKind = "MODIFIED"
+	ChangeDeleted     ChangeKind = "DELETED"
+	ChangeRenamed     ChangeKind = "RENAMED"
+	ChangeCopied      ChangeKind = "COPIED"
+	ChangeTypeChanged ChangeKind = "TYPE_CHANGED"
 )
 
 type ChangedPath struct {
@@ -40,32 +42,42 @@ type ChangedPath struct {
 	Kind    ChangeKind `json:"kind"`
 }
 
+// SyncCommand 输入:SyncCommand
 type SyncCommand struct {
-	Scope          common.Scope `json:"scope"`
-	RepositoryPath string       `json:"repository_path"`
-	Provider       string       `json:"provider"`
-	Ref            string       `json:"ref"`
-	CredentialsRef string       `json:"credentials_ref,omitempty"`
-	IncludePaths   []string     `json:"include_paths,omitempty"`
-	IdempotencyKey string       `json:"idempotency_key"`
+	Scope          common.Scope `json:"scope"`           // 租户、仓库、快照和Trace隔离信息
+	RepositoryPath string       `json:"repository_path"` // Git仓库路径(目前只支持本地)
+	RepositoryURL  string       `json:"repository_url,omitempty"`
+	Provider       string       `json:"provider"`                  // 限制Provide为本地
+	Ref            string       `json:"ref"`                       // 分支
+	CredentialsRef string       `json:"credentials_ref,omitempty"` //
+	IncludePaths   []string     `json:"include_paths,omitempty"`   // 限制需要解析的目录
+	IdempotencyKey string       `json:"idempotency_key"`           // 防止同一个请求重复还行
 }
 
 func (c SyncCommand) Validate() error {
 	if err := c.Scope.Validate(false); err != nil {
 		return err
 	}
-	if strings.TrimSpace(c.RepositoryPath) == "" || strings.TrimSpace(c.Ref) == "" {
-		return fmt.Errorf("repository_path 和 ref 不能为空")
+	hasPath, hasURL := strings.TrimSpace(c.RepositoryPath) != "", strings.TrimSpace(c.RepositoryURL) != ""
+	if hasPath == hasURL || strings.TrimSpace(c.Ref) == "" {
+		return fmt.Errorf("repository_path 和 repository_url 必须且只能提供一个，ref 不能为空")
 	}
-	if c.Provider != "" && c.Provider != "local" {
-		return fmt.Errorf("本地适配器不支持 provider %q", c.Provider)
+	if c.Provider != "" && c.Provider != "local" && c.Provider != "git" && c.Provider != "github" && c.Provider != "gitlab" {
+		return fmt.Errorf("不支持 provider %q", c.Provider)
+	}
+	if c.Provider == "local" && !hasPath || c.Provider != "" && c.Provider != "local" && !hasURL {
+		return fmt.Errorf("local provider 需要 repository_path，远程 provider 需要 repository_url")
 	}
 	if strings.TrimSpace(c.IdempotencyKey) == "" {
 		return fmt.Errorf("idempotency_key 不能为空")
 	}
+	if strings.TrimSpace(c.Scope.TraceID) == "" {
+		return fmt.Errorf("trace_id 不能为空")
+	}
 	return nil
 }
 
+// Snapshot 快照
 type Snapshot struct {
 	common.EntityMeta
 	SnapshotID       string        `json:"snapshot_id"`
@@ -80,6 +92,7 @@ type Snapshot struct {
 	RetryCount       int           `json:"retry_count"`
 }
 
+// ParseJob 解析任务
 type ParseJob struct {
 	common.EntityMeta
 	JobID         string     `json:"job_id"`
@@ -147,6 +160,32 @@ type ParseResult struct {
 	DeletedPaths []string             `json:"deleted_paths,omitempty"`
 	SkippedFiles []SkippedFile        `json:"skipped_files,omitempty"`
 	Event        common.EventEnvelope `json:"event"`
+}
+
+func (r ParseResult) Validate() error {
+	if r.Job.SnapshotID != r.Snapshot.SnapshotID {
+		return fmt.Errorf("job.snapshot_id 与 snapshot_id 不一致")
+	}
+	if r.Job.Status != r.Snapshot.SyncStatus || r.Job.EntityMeta.Status != string(r.Job.Status) || r.Snapshot.EntityMeta.Status != string(r.Snapshot.SyncStatus) {
+		return fmt.Errorf("job、snapshot 和 metadata 状态不一致")
+	}
+	switch r.Job.Status {
+	case StatusSucceeded:
+		if r.Job.Progress != 100 || strings.TrimSpace(r.Snapshot.CommitSHA) == "" {
+			return fmt.Errorf("成功结果必须具有完整进度和 commit")
+		}
+	case StatusFailed:
+		if r.Job.ErrorCode == "" || r.Job.ErrorMessage == "" || r.Snapshot.ErrorCode == "" || r.Snapshot.ErrorMessage == "" {
+			return fmt.Errorf("失败结果必须具有错误信息")
+		}
+	case StatusCancelled:
+		if r.Job.ErrorCode == "" || r.Job.ErrorMessage == "" || r.Snapshot.ErrorCode == "" || r.Snapshot.ErrorMessage == "" {
+			return fmt.Errorf("取消结果必须具有原因")
+		}
+	default:
+		return fmt.Errorf("不允许保存未知或非终态状态 %q", r.Job.Status)
+	}
+	return nil
 }
 
 type SkippedFile struct {

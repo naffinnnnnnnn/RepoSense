@@ -3,9 +3,12 @@ package observability
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"sync"
 	"time"
+
+	"github.com/reposense/reposense/internal/domain/repository"
 )
 
 type Observer struct {
@@ -51,6 +54,10 @@ func (o *Observer) Count(name string, value int64, attrs map[string]string) {
 func errorType(err error) string {
 	if err == nil {
 		return ""
+	}
+	var domain *repository.DomainError
+	if errors.As(err, &domain) {
+		return string(domain.Code) + ":" + domain.Operation
 	}
 	return "operation_failed"
 }

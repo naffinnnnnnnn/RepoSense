@@ -24,9 +24,9 @@ type CStyle struct {
 }
 
 func NewTypeScript() *CStyle {
-	return &CStyle{"typescript", "typescript-structural@1.0.0", []string{".ts", ".tsx", ".js", ".jsx", ".mts", ".cts"}}
+	return &CStyle{"typescript", "typescript-structural@2.0.0", []string{".ts", ".tsx", ".js", ".jsx", ".mts", ".cts"}}
 }
-func NewJava() *CStyle                 { return &CStyle{"java", "java-structural@1.0.0", []string{".java"}} }
+func NewJava() *CStyle                 { return &CStyle{"java", "java-structural@2.0.0", []string{".java"}} }
 func (p *CStyle) Language() string     { return p.language }
 func (p *CStyle) Extensions() []string { return p.extensions }
 func (p *CStyle) Version() string      { return p.version }
@@ -38,18 +38,24 @@ type cFrame struct {
 }
 
 func (p *CStyle) Parse(ctx context.Context, commit string, file repository.FileContent) (repository.ParsedFile, error) {
+	cleanPath, err := repository.CanonicalPath(file.Path)
+	if err != nil {
+		return repository.ParsedFile{}, err
+	}
+	file.Path = cleanPath
 	result := repository.ParsedFile{}
 	root := fileArtifact(commit, file, p.language, repository.ArtifactFile)
 	result.Artifacts = append(result.Artifacts, root)
 	frames := []cFrame{{-1, file.Path, root.ArtifactID, repository.ArtifactFile}}
 	depth := 0
 	lines := strings.Split(string(file.Content), "\n")
+	inBlockComment := false
 	for i, raw := range lines {
 		if err := ctx.Err(); err != nil {
 			return repository.ParsedFile{}, err
 		}
 		lineNo := i + 1
-		line := strings.TrimSpace(stripCStyle(raw))
+		line := strings.TrimSpace(stripCStyle(stripBlockComments(raw, &inBlockComment)))
 		for len(frames) > 1 && depth < frames[len(frames)-1].depth {
 			frames = frames[:len(frames)-1]
 		}
@@ -106,6 +112,31 @@ func (p *CStyle) Parse(ctx context.Context, commit string, file repository.FileC
 	}
 	finalizeCStyleRanges(result.Artifacts, lines)
 	return result, nil
+}
+
+func stripBlockComments(line string, inBlock *bool) string {
+	var out strings.Builder
+	for i := 0; i < len(line); {
+		if *inBlock {
+			end := strings.Index(line[i:], "*/")
+			if end < 0 {
+				return out.String()
+			}
+			i += end + 2
+			*inBlock = false
+			continue
+		}
+		start := strings.Index(line[i:], "/*")
+		if start < 0 {
+			out.WriteString(line[i:])
+			break
+		}
+		start += i
+		out.WriteString(line[i:start])
+		i = start + 2
+		*inBlock = true
+	}
+	return out.String()
 }
 
 func (p *CStyle) importTarget(line string) (string, bool) {

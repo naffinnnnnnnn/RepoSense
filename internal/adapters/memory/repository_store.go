@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"sync"
@@ -16,10 +17,14 @@ type RepositoryStore struct {
 	results   map[string]repository.ParseResult
 	latest    map[string]string
 	snapshots map[string]repository.Snapshot
+	tasks     map[string]repository.ParseTask
+	taskKeys  map[string]string
+	bindings  map[string]repository.RepositoryBinding
+	outbox    map[string]repository.OutboxRecord
 }
 
 func NewRepositoryStore() *RepositoryStore {
-	return &RepositoryStore{results: map[string]repository.ParseResult{}, latest: map[string]string{}, snapshots: map[string]repository.Snapshot{}}
+	return &RepositoryStore{results: map[string]repository.ParseResult{}, latest: map[string]string{}, snapshots: map[string]repository.Snapshot{}, tasks: map[string]repository.ParseTask{}, taskKeys: map[string]string{}, bindings: map[string]repository.RepositoryBinding{}, outbox: map[string]repository.OutboxRecord{}}
 }
 
 func (s *RepositoryStore) GraphInput(ctx context.Context, scope common.Scope) (graph.BuildInput, error) {
@@ -48,7 +53,15 @@ func (s *RepositoryStore) FindByIdempotencyKey(ctx context.Context, scope common
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	r, ok := s.results[resultKey(scope, key)]
+	rk := resultKey(scope, key)
+	if jobID, exists := s.taskKeys[rk]; exists {
+		if task, taskExists := s.tasks[jobID]; taskExists {
+			if stored, resultExists := s.results[rk]; !resultExists || stored.Job.JobID != jobID {
+				return repository.ParseResult{Job: task.Job, Snapshot: task.Snapshot, Artifacts: []repository.CodeArtifact{}, Relations: []repository.CodeRelation{}, DeletedPaths: []string{}, SkippedFiles: []repository.SkippedFile{}}, true, nil
+			}
+		}
+	}
+	r, ok := s.results[rk]
 	return cloneResult(r), ok, nil
 }
 func (s *RepositoryStore) LatestSnapshot(ctx context.Context, scope common.Scope) (repository.Snapshot, bool, error) {
@@ -69,17 +82,24 @@ func (s *RepositoryStore) SaveResult(ctx context.Context, key string, result rep
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := result.Validate(); err != nil {
+		return fmt.Errorf("解析结果无效: %w", err)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.saveResultLocked(key, result)
+}
+func (s *RepositoryStore) saveResultLocked(key string, result repository.ParseResult) error {
 	rk := resultKey(common.Scope{TenantID: result.Snapshot.TenantID, RepositoryID: result.Snapshot.RepositoryID}, key)
-	if existing, ok := s.results[rk]; ok && existing.Snapshot.CommitSHA != result.Snapshot.CommitSHA {
-		return fmt.Errorf("同一幂等键不能用于不同的 commit")
-	}
 	stored := cloneResult(result)
 	s.results[rk] = stored
 	s.snapshots[result.Snapshot.SnapshotID] = stored.Snapshot
 	if result.Snapshot.SyncStatus == repository.StatusSucceeded {
 		s.latest[scopeKey(common.Scope{TenantID: result.Snapshot.TenantID, RepositoryID: result.Snapshot.RepositoryID})] = result.Snapshot.SnapshotID
+	}
+	if result.Event.EventID != "" {
+		payload, _ := json.Marshal(result.Event.Payload)
+		s.outbox[result.Event.EventID] = repository.OutboxRecord{TenantID: result.Snapshot.TenantID, RepositoryID: result.Snapshot.RepositoryID, Event: result.Event, EventID: result.Event.EventID, EventType: result.Event.EventType, AggregateID: result.Event.AggregateID, TraceID: result.Event.TraceID, PayloadVersion: result.Event.PayloadVersion, Payload: payload, OccurredAt: result.Event.OccurredAt, NextAttemptAt: result.Event.OccurredAt}
 	}
 	return nil
 }
@@ -116,6 +136,9 @@ func (s *RepositoryStore) Artifacts(ctx context.Context, scope common.Scope, cur
 	var found []repository.CodeArtifact
 	for _, result := range s.results {
 		if result.Snapshot.SnapshotID == scope.SnapshotID && result.Snapshot.TenantID == scope.TenantID && result.Snapshot.RepositoryID == scope.RepositoryID {
+			if result.Snapshot.SyncStatus != repository.StatusSucceeded {
+				return []repository.CodeArtifact{}, "", fmt.Errorf("失败快照不提供 artifact")
+			}
 			found = result.Artifacts
 			break
 		}

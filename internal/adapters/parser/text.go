@@ -3,6 +3,7 @@ package parser
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -22,6 +23,17 @@ func (*Text) Extensions() []string {
 func (*Text) Parse(ctx context.Context, commit string, file repository.FileContent) (repository.ParsedFile, error) {
 	if err := ctx.Err(); err != nil {
 		return repository.ParsedFile{}, err
+	}
+	clean, err := repository.CanonicalPath(file.Path)
+	if err != nil {
+		return repository.ParsedFile{}, err
+	}
+	file.Path = clean
+	if strings.EqualFold(filepath.Base(file.Path), "package.json") {
+		var document any
+		if err := json.Unmarshal(file.Content, &document); err != nil {
+			return repository.ParsedFile{}, fmt.Errorf("package.json 语法无效: %w", err)
+		}
 	}
 	ext := strings.ToLower(filepath.Ext(file.Path))
 	kind := repository.ArtifactConfig
