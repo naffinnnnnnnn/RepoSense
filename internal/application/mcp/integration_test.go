@@ -82,7 +82,7 @@ func integratedFacade(t *testing.T, quota int) (*mcpapp.Service, *memory.MCPAudi
 		{ArtifactID: "token", Kind: repository.ArtifactFunction, Name: "IssueToken", QualifiedName: "token.IssueToken", Language: "go", SourceRef: refToken, Signature: "IssueToken(user) string", ContentHash: refToken.ContentHash},
 	}
 	store := memory.NewRepositoryStore()
-	parsed := repository.ParseResult{Snapshot: repository.Snapshot{EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID}, SnapshotID: scope.SnapshotID, CommitSHA: commit, SyncStatus: repository.StatusSucceeded}, Artifacts: artifacts,
+	parsed := repository.ParseResult{Snapshot: repository.Snapshot{EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID, Status: string(repository.StatusSucceeded)}, SnapshotID: scope.SnapshotID, CommitSHA: commit, SyncStatus: repository.StatusSucceeded}, Job: repository.ParseJob{EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID, Status: string(repository.StatusSucceeded)}, JobID: "parse-job", SnapshotID: scope.SnapshotID, Status: repository.StatusSucceeded, Progress: 100}, Artifacts: artifacts,
 		Relations: []repository.CodeRelation{{RelationID: "calls", Kind: repository.RelationCalls, From: "handler", To: "token", Evidence: refHandler, Confidence: 1}}}
 	if err := store.SaveResult(ctx, "parse", parsed); err != nil {
 		t.Fatal(err)

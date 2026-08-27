@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"os"
@@ -8,12 +9,17 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/reposense/reposense/internal/adapters/memory"
+	"github.com/reposense/reposense/internal/domain/common"
 	"github.com/reposense/reposense/internal/domain/repository"
 )
 
 // TestRunPersistsStateAcrossInvocationsForIncrementalSync 验证两次独立 CLI 调用能否共享上一次成功快照。
 // 第二次调用发生在仓库产生新 commit 之后，工程预期应基于第一次快照执行增量解析。
 func TestRunPersistsStateAcrossInvocationsForIncrementalSync(t *testing.T) {
+	originalStore := workerRepositoryStore
+	workerRepositoryStore = memory.NewRepositoryStore()
+	t.Cleanup(func() { workerRepositoryStore = originalStore })
 	repoPath := createWorkerTestRepository(t)
 
 	firstOutput, err := captureWorkerStdout(t, func() error {
@@ -54,8 +60,26 @@ func TestRunPersistsStateAcrossInvocationsForIncrementalSync(t *testing.T) {
 
 // TestRunPublishesRepositoryParseEvent 记录 CLI 事件发布验证当前受到的结构性限制。
 func TestRunPublishesRepositoryParseEvent(t *testing.T) {
-	// run 内部把 EventPublisher 固定传为 nil，且项目没有可连接的事件 Broker，测试无法注入记录器观察 Publish。
-	t.Skip("BLOCKED：CLI 没有 EventPublisher 注入点，无法对真实事件发布行为做黑盒验证")
+	repoPath := createWorkerTestRepository(t)
+	recorder := &workerEventRecorder{}
+	original := workerEventPublisher
+	originalStore := workerRepositoryStore
+	workerEventPublisher = recorder
+	workerRepositoryStore = memory.NewRepositoryStore()
+	t.Cleanup(func() { workerEventPublisher = original; workerRepositoryStore = originalStore })
+	if _, err := captureWorkerStdout(t, func() error { return run(workerArgs(repoPath)) }); err != nil {
+		t.Fatal(err)
+	}
+	if len(recorder.events) != 1 || recorder.events[0].EventType != "parse.completed.v1" {
+		t.Fatalf("CLI 未发布解析事件：%#v", recorder.events)
+	}
+}
+
+type workerEventRecorder struct{ events []common.EventEnvelope }
+
+func (r *workerEventRecorder) Publish(_ context.Context, event common.EventEnvelope) error {
+	r.events = append(r.events, event)
+	return nil
 }
 
 // TestRunRejectsNonPositiveTimeoutAsInvalidInput 验证零值和负数超时会在参数层被明确拒绝。

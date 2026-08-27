@@ -41,6 +41,7 @@ func TestServiceBuildsAndQueriesResolvedGraph(t *testing.T) {
 	callee := artifact("callee", repository.ArtifactFunction, "issue", "tokens.issue", commit, 6, 8)
 	parsed := repository.ParseResult{Snapshot: snapshot(scope, "", commit, []repository.ChangedPath{{Path: "service.py", Kind: repository.ChangeAdded}, {Path: "tokens.py", Kind: repository.ChangeAdded}}), Artifacts: []repository.CodeArtifact{file, caller, callee}, Relations: []repository.CodeRelation{
 		relation("contains", repository.RelationContains, file.ArtifactID, caller.ArtifactID, commit, "service.py", 2, 1), relation("calls", repository.RelationCalls, caller.ArtifactID, "symbol:issue", commit, "service.py", 3, .8)}}
+	completeResult(&parsed)
 	if err := repositories.SaveResult(context.Background(), "parse1", parsed); err != nil {
 		t.Fatal(err)
 	}
@@ -80,6 +81,7 @@ func TestIncrementalBuildRemovesChangedAndDeletedArtifactsWithoutMutatingParent(
 	oldB := artifact("stable-b", repository.ArtifactFunction, "b", "b", oldCommit, 1, 2)
 	oldC := artifact("stable-c", repository.ArtifactFunction, "c", "helpers.c", oldCommit, 1, 2)
 	base := repository.ParseResult{Snapshot: snapshot(baseScope, "", oldCommit, []repository.ChangedPath{{Path: "a.py", Kind: repository.ChangeAdded}, {Path: "b.py", Kind: repository.ChangeAdded}}), Artifacts: []repository.CodeArtifact{oldA, oldB}, Relations: []repository.CodeRelation{relation("oldcall", repository.RelationCalls, oldA.ArtifactID, oldB.ArtifactID, oldCommit, "a.py", 1, 1), relation("stablecall", repository.RelationCalls, oldC.ArtifactID, oldA.ArtifactID, oldCommit, "helpers.py", 1, 1)}}
+	completeResult(&base)
 	oldA.SourceRef.Path = "a.py"
 	oldB.SourceRef.Path = "b.py"
 	oldC.SourceRef.Path = "helpers.py"
@@ -97,6 +99,7 @@ func TestIncrementalBuildRemovesChangedAndDeletedArtifactsWithoutMutatingParent(
 	newA := artifact("stable-a", repository.ArtifactFunction, "a", "a", newCommit, 1, 3)
 	newA.SourceRef.Path = "a.py"
 	child := repository.ParseResult{Snapshot: snapshot(childScope, "base", newCommit, []repository.ChangedPath{{Path: "a.py", Kind: repository.ChangeModified}, {Path: "b.py", Kind: repository.ChangeDeleted}}), Artifacts: []repository.CodeArtifact{newA}, Relations: []repository.CodeRelation{relation("newcall", repository.RelationCalls, newA.ArtifactID, "symbol:c", newCommit, "a.py", 2, .8)}, DeletedPaths: []string{"b.py"}}
+	completeResult(&child)
 	if err := repositories.SaveResult(context.Background(), "p2", child); err != nil {
 		t.Fatal(err)
 	}
@@ -128,6 +131,7 @@ func TestAmbiguousSymbolStaysUnresolved(t *testing.T) {
 	one.SourceRef.Path = "x.py"
 	two.SourceRef.Path = "y.py"
 	input := repository.ParseResult{Snapshot: snapshot(scope, "", commit, nil), Artifacts: []repository.CodeArtifact{caller, one, two}, Relations: []repository.CodeRelation{relation("r", repository.RelationCalls, "c", "symbol:same", commit, "main.py", 1, .5)}}
+	completeResult(&input)
 	if err := repositories.SaveResult(context.Background(), "p", input); err != nil {
 		t.Fatal(err)
 	}
@@ -152,8 +156,8 @@ func TestServiceRejectsFailedParseResultBeforeGraphBuild(t *testing.T) {
 	}
 	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", SnapshotID: "failed-snapshot", TraceID: "trace"}
 	parsed := repository.ParseResult{
-		Snapshot: repository.Snapshot{EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID, Status: string(repository.StatusFailed)}, SnapshotID: scope.SnapshotID, CommitSHA: "sha", SyncStatus: repository.StatusFailed, ErrorCode: string(repository.ErrParseFailure)},
-		Job:      repository.ParseJob{EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID, Status: string(repository.StatusFailed)}, JobID: "job", SnapshotID: scope.SnapshotID, Status: repository.StatusFailed, ErrorCode: string(repository.ErrParseFailure)},
+		Snapshot: repository.Snapshot{EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID, Status: string(repository.StatusFailed)}, SnapshotID: scope.SnapshotID, CommitSHA: "sha", SyncStatus: repository.StatusFailed, ErrorCode: string(repository.ErrParseFailure), ErrorMessage: "代码文件解析失败"},
+		Job:      repository.ParseJob{EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID, Status: string(repository.StatusFailed)}, JobID: "job", SnapshotID: scope.SnapshotID, Status: repository.StatusFailed, ErrorCode: string(repository.ErrParseFailure), ErrorMessage: "代码文件解析失败"},
 	}
 	if err := repositories.SaveResult(context.Background(), "failed", parsed); err != nil {
 		t.Fatal(err)
@@ -174,5 +178,9 @@ func relation(id string, kind repository.RelationKind, from, to, commit, path st
 	return repository.CodeRelation{RelationID: id, Kind: kind, From: from, To: to, Evidence: common.SourceRef{CommitSHA: commit, Path: path, StartLine: line, EndLine: line, ContentHash: "sha256:e"}, Confidence: confidence}
 }
 func snapshot(scope common.Scope, parent, commit string, changes []repository.ChangedPath) repository.Snapshot {
-	return repository.Snapshot{EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID}, SnapshotID: scope.SnapshotID, ParentSnapshotID: parent, CommitSHA: commit, SyncStatus: repository.StatusSucceeded, ChangedPaths: changes}
+	return repository.Snapshot{EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID, Status: string(repository.StatusSucceeded)}, SnapshotID: scope.SnapshotID, ParentSnapshotID: parent, CommitSHA: commit, SyncStatus: repository.StatusSucceeded, ChangedPaths: changes}
+}
+
+func completeResult(result *repository.ParseResult) {
+	result.Job = repository.ParseJob{EntityMeta: common.EntityMeta{TenantID: result.Snapshot.TenantID, RepositoryID: result.Snapshot.RepositoryID, Status: string(repository.StatusSucceeded)}, JobID: result.Snapshot.SnapshotID + "-job", SnapshotID: result.Snapshot.SnapshotID, Status: repository.StatusSucceeded, Progress: 100}
 }

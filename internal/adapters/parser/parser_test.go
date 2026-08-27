@@ -73,8 +73,8 @@ func TestDefaultRegistryDocumentsSupportedAndUnsupportedPaths(t *testing.T) {
 		{path: "README.MD", wantLanguage: "text", supported: true},
 		{path: "Dockerfile", wantLanguage: "text", supported: true},
 		{path: "go.mod", wantLanguage: "text", supported: true},
-		{path: "main.go", supported: false},
-		{path: "lib.rs", supported: false},
+		{path: "main.go", wantLanguage: "go", supported: true},
+		{path: "lib.rs", wantLanguage: "rust", supported: true},
 		{path: "service.cs", supported: false},
 	}
 	for _, tt := range tests {
@@ -87,6 +87,67 @@ func TestDefaultRegistryDocumentsSupportedAndUnsupportedPaths(t *testing.T) {
 				t.Fatalf("解析器路由错误：got=%s want=%s", parser.Language(), tt.wantLanguage)
 			}
 		})
+	}
+}
+
+func TestGoAndRustParsersProduceCommonIR(t *testing.T) {
+	tests := []struct {
+		name   string
+		parser interface {
+			Parse(context.Context, string, repository.FileContent) (repository.ParsedFile, error)
+		}
+		path, source, function, importTarget string
+	}{
+		{name: "go", parser: NewGo(), path: "cmd/app/main.go", source: "package main\nimport \"fmt\"\ntype Service struct{}\nfunc run() { fmt.Println(\"ok\") }\n", function: "run", importTarget: "module:fmt"},
+		{name: "rust", parser: NewRust(), path: "src/lib.rs", source: "use std::fmt;\npub struct Service {}\npub fn run() { helper(); }\nfn helper() {}\n", function: "run", importTarget: "module:std::fmt"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parsed, err := tt.parser.Parse(context.Background(), strings.Repeat("a", 40), repository.FileContent{Path: tt.path, Content: []byte(tt.source)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if findArtifact(parsed, repository.ArtifactFunction, tt.function) == nil {
+				t.Fatalf("未提取函数：%#v", parsed.Artifacts)
+			}
+			assertRelation(t, parsed, repository.RelationImports, tt.importTarget)
+		})
+	}
+}
+
+func TestRustParserTracksImplMethodsAndStableCallsAcrossBlankLines(t *testing.T) {
+	parser := NewRust()
+	source := "struct Greeter {}\nimpl Greeter {\n    fn helper(&self) {}\n    fn run(&self) {\n        helper();\n    }\n}\n"
+	first, err := parser.Parse(context.Background(), "commit", repository.FileContent{Path: "src/lib.rs", Content: []byte(source)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := parser.Parse(context.Background(), "commit", repository.FileContent{Path: "src/lib.rs", Content: []byte("\n" + source)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	methodIDs := map[string]bool{}
+	for _, artifact := range first.Artifacts {
+		if artifact.Kind == repository.ArtifactMethod {
+			methodIDs[artifact.ArtifactID] = true
+		}
+	}
+	if len(methodIDs) != 2 {
+		t.Fatalf("应识别两个 impl 方法：%#v", first.Artifacts)
+	}
+	var firstCall, secondCall string
+	for _, relation := range first.Relations {
+		if relation.Kind == repository.RelationCalls {
+			firstCall = relation.RelationID
+		}
+	}
+	for _, relation := range second.Relations {
+		if relation.Kind == repository.RelationCalls {
+			secondCall = relation.RelationID
+		}
+	}
+	if firstCall == "" || firstCall != secondCall {
+		t.Fatalf("空行不应改变语义 RelationID：%q != %q", firstCall, secondCall)
 	}
 }
 

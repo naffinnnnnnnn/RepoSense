@@ -18,6 +18,7 @@ func TestRepositoryRAGAssistantIntegration(t *testing.T) {
 	store := memory.NewRepositoryStore()
 	result := repository.ParseResult{Snapshot: repository.Snapshot{EntityMeta: repository.NewMeta("snap", scope, repository.StatusSucceeded, time.Unix(1, 0)),
 		SnapshotID: "snap", CommitSHA: "sha", SyncStatus: repository.StatusSucceeded},
+		Job: repository.ParseJob{EntityMeta: repository.NewMeta("job", scope, repository.StatusSucceeded, time.Unix(1, 0)), JobID: "job", SnapshotID: "snap", Status: repository.StatusSucceeded, Progress: 100},
 		Artifacts: []repository.CodeArtifact{{ArtifactID: "file", Kind: repository.ArtifactFile, Name: "main.go", QualifiedName: "main.go", Language: "go", SourceRef: ref, ContentHash: ref.ContentHash},
 			{ArtifactID: "main", Kind: repository.ArtifactFunction, Name: "main", QualifiedName: "main", Language: "go", SourceRef: ref, ContentHash: ref.ContentHash}}}
 	if err := store.SaveResult(ctx, "parse-key", result); err != nil {

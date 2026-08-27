@@ -120,7 +120,7 @@ func TestFailureRetryabilityMatchesCause(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			result, syncErr := service.Sync(context.Background(), repository.SyncCommand{Scope: common.Scope{TenantID: "tenant", RepositoryID: "repo"}, RepositoryPath: "ignored", Ref: "main", IdempotencyKey: "key"})
+			result, syncErr := service.Sync(context.Background(), repository.SyncCommand{Scope: common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}, RepositoryPath: "ignored", Ref: "main", IdempotencyKey: "key"})
 			var domainErr *repository.DomainError
 			if !errors.As(syncErr, &domainErr) {
 				t.Fatalf("失败必须返回 DomainError：%v", syncErr)
@@ -154,7 +154,7 @@ func TestFailureReportingPreservesPrimaryAndSecondaryCauses(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		result, syncErr := service.Sync(context.Background(), repository.SyncCommand{Scope: common.Scope{TenantID: "tenant", RepositoryID: "repo-save"}, RepositoryPath: "ignored", Ref: "main", IdempotencyKey: "key"})
+		result, syncErr := service.Sync(context.Background(), repository.SyncCommand{Scope: common.Scope{TenantID: "tenant", RepositoryID: "repo-save", TraceID: "trace"}, RepositoryPath: "ignored", Ref: "main", IdempotencyKey: "key"})
 		if result.Job.Status != repository.StatusFailed {
 			t.Errorf("二次保存失败时仍应返回阶段性失败结果：%#v", result.Job)
 		}
@@ -170,7 +170,7 @@ func TestFailureReportingPreservesPrimaryAndSecondaryCauses(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		scope := common.Scope{TenantID: "tenant", RepositoryID: "repo-publish"}
+		scope := common.Scope{TenantID: "tenant", RepositoryID: "repo-publish", TraceID: "trace"}
 		_, syncErr := service.Sync(context.Background(), repository.SyncCommand{Scope: scope, RepositoryPath: "ignored", Ref: "main", IdempotencyKey: "key"})
 		if !errors.Is(syncErr, primary) || !errors.Is(syncErr, secondary) {
 			t.Errorf("错误链必须同时保留主错误和发布错误：%v", syncErr)
@@ -202,7 +202,7 @@ func TestFailureMessagesPreserveSanitizedOperationMeaning(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			result, syncErr := service.Sync(context.Background(), repository.SyncCommand{Scope: common.Scope{TenantID: "tenant", RepositoryID: "repo"}, RepositoryPath: "ignored", Ref: "main", IdempotencyKey: "key"})
+			result, syncErr := service.Sync(context.Background(), repository.SyncCommand{Scope: common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}, RepositoryPath: "ignored", Ref: "main", IdempotencyKey: "key"})
 			var domainErr *repository.DomainError
 			if !errors.As(syncErr, &domainErr) {
 				t.Fatalf("失败必须返回 DomainError：%v", syncErr)
@@ -228,7 +228,7 @@ func TestIdempotencyRetryReexecutesFailedResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := repository.SyncCommand{Scope: common.Scope{TenantID: "tenant", RepositoryID: "repo-retry"}, RepositoryPath: "ignored", Ref: "main", IdempotencyKey: "same-key"}
+	cmd := repository.SyncCommand{Scope: common.Scope{TenantID: "tenant", RepositoryID: "repo-retry", TraceID: "trace"}, RepositoryPath: "ignored", Ref: "main", IdempotencyKey: "same-key"}
 	failed, firstErr := service.Sync(context.Background(), cmd)
 	if firstErr == nil || failed.Job.Status != repository.StatusFailed {
 		t.Fatalf("首次调用应保存失败结果：result=%#v err=%v", failed, firstErr)
@@ -315,6 +315,14 @@ func (s *sequenceIDs) New(prefix string) string {
 type fixedClock struct{}
 
 func (fixedClock) Now() time.Time { return time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC) }
+
+func successfulBaseline(scope common.Scope, snapshotID, commit string) repository.ParseResult {
+	now := fixedClock{}.Now()
+	return repository.ParseResult{
+		Snapshot: repository.Snapshot{EntityMeta: repository.NewMeta(snapshotID, scope, repository.StatusSucceeded, now), SnapshotID: snapshotID, CommitSHA: commit, SyncStatus: repository.StatusSucceeded},
+		Job:      repository.ParseJob{EntityMeta: repository.NewMeta(snapshotID+"-job", scope, repository.StatusSucceeded, now), JobID: snapshotID + "-job", SnapshotID: snapshotID, Status: repository.StatusSucceeded, Progress: 100},
+	}
+}
 
 // recordingPublisher 为构造测试提供一个显式、可工作的事件发布依赖。
 type recordingPublisher struct{}
@@ -924,10 +932,7 @@ func TestServiceRejectsRepositoryPathReuseForSameRepositoryID(t *testing.T) {
 func TestConcurrentIncrementalSyncsFormLinearSnapshotChain(t *testing.T) {
 	store := newObservingBaselineStore()
 	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}
-	base := repository.ParseResult{Snapshot: repository.Snapshot{
-		EntityMeta: repository.NewMeta("snapshot-0", scope, repository.StatusSucceeded, fixedClock{}.Now()),
-		SnapshotID: "snapshot-0", CommitSHA: "0000000000000000000000000000000000000000", SyncStatus: repository.StatusSucceeded,
-	}}
+	base := successfulBaseline(scope, "snapshot-0", "0000000000000000000000000000000000000000")
 	if err := store.delegate.SaveResult(context.Background(), "base", base); err != nil {
 		t.Fatal(err)
 	}
@@ -999,10 +1004,7 @@ func TestConcurrentIncrementalSyncsFormLinearSnapshotChain(t *testing.T) {
 func TestServiceFallsBackToFullSyncWhenPreviousCommitDisappears(t *testing.T) {
 	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}
 	store := memory.NewRepositoryStore()
-	base := repository.ParseResult{Snapshot: repository.Snapshot{
-		EntityMeta: repository.NewMeta("old-snapshot", scope, repository.StatusSucceeded, fixedClock{}.Now()),
-		SnapshotID: "old-snapshot", CommitSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", SyncStatus: repository.StatusSucceeded,
-	}}
+	base := successfulBaseline(scope, "old-snapshot", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	if err := store.SaveResult(context.Background(), "old", base); err != nil {
 		t.Fatal(err)
 	}
@@ -1076,10 +1078,7 @@ func TestServiceRejectsMalformedGitChanges(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}
 			store := memory.NewRepositoryStore()
-			base := repository.ParseResult{Snapshot: repository.Snapshot{
-				EntityMeta: repository.NewMeta("base", scope, repository.StatusSucceeded, fixedClock{}.Now()),
-				SnapshotID: "base", CommitSHA: baseSHA, SyncStatus: repository.StatusSucceeded,
-			}}
+			base := successfulBaseline(scope, "base", baseSHA)
 			if err := store.SaveResult(context.Background(), "base", base); err != nil {
 				t.Fatal(err)
 			}
@@ -1113,10 +1112,7 @@ func TestServiceDeduplicatesIdenticalGitChanges(t *testing.T) {
 	currentSHA := "1111111111111111111111111111111111111111"
 	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}
 	store := memory.NewRepositoryStore()
-	base := repository.ParseResult{Snapshot: repository.Snapshot{
-		EntityMeta: repository.NewMeta("base", scope, repository.StatusSucceeded, fixedClock{}.Now()),
-		SnapshotID: "base", CommitSHA: baseSHA, SyncStatus: repository.StatusSucceeded,
-	}}
+	base := successfulBaseline(scope, "base", baseSHA)
 	if err := store.SaveResult(context.Background(), "base", base); err != nil {
 		t.Fatal(err)
 	}
@@ -1152,10 +1148,7 @@ func TestServiceOrdersEqualPathsDeterministically(t *testing.T) {
 		t.Helper()
 		scope := common.Scope{TenantID: "tenant", RepositoryID: "repo-" + key, TraceID: "trace"}
 		store := memory.NewRepositoryStore()
-		base := repository.ParseResult{Snapshot: repository.Snapshot{
-			EntityMeta: repository.NewMeta("base", scope, repository.StatusSucceeded, fixedClock{}.Now()),
-			SnapshotID: "base", CommitSHA: baseSHA, SyncStatus: repository.StatusSucceeded,
-		}}
+		base := successfulBaseline(scope, "base", baseSHA)
 		if err := store.SaveResult(context.Background(), "base", base); err != nil {
 			t.Fatal(err)
 		}
@@ -1196,10 +1189,7 @@ func TestServiceValidatesDeletedAndRenamedOldPaths(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}
 			store := memory.NewRepositoryStore()
-			base := repository.ParseResult{Snapshot: repository.Snapshot{
-				EntityMeta: repository.NewMeta("base", scope, repository.StatusSucceeded, fixedClock{}.Now()),
-				SnapshotID: "base", CommitSHA: baseSHA, SyncStatus: repository.StatusSucceeded,
-			}}
+			base := successfulBaseline(scope, "base", baseSHA)
 			if err := store.SaveResult(context.Background(), "base", base); err != nil {
 				t.Fatal(err)
 			}
@@ -1222,8 +1212,12 @@ func TestServiceValidatesDeletedAndRenamedOldPaths(t *testing.T) {
 			if git.ReadCount() != 0 {
 				t.Fatalf("路径校验必须发生在 ReadFile 前，reads=%d", git.ReadCount())
 			}
-			if _, saved, lookupErr := store.FindByIdempotencyKey(context.Background(), scope, key); lookupErr != nil || saved {
-				t.Fatalf("不安全变更不应被持久化：saved=%v err=%v", saved, lookupErr)
+			stored, saved, lookupErr := store.FindByIdempotencyKey(context.Background(), scope, key)
+			if lookupErr != nil || !saved || stored.Job.Status != repository.StatusFailed {
+				t.Fatalf("不安全变更应形成失败终态：saved=%v result=%#v err=%v", saved, stored, lookupErr)
+			}
+			if len(stored.DeletedPaths) != 0 || len(stored.Snapshot.ChangedPaths) != 0 {
+				t.Fatalf("不安全路径不得进入失败结果或事件：%#v", stored)
 			}
 		})
 	}
@@ -1311,7 +1305,7 @@ func TestServicePersistsParserFailure(t *testing.T) {
 	if !repository.IsCode(syncErr, repository.ErrParseFailure) || !errors.Is(syncErr, cause) {
 		t.Fatalf("Parser 错误分类或 cause 丢失：%v", syncErr)
 	}
-	if result.Job.Status != repository.StatusFailed || result.Job.ErrorMessage != "仓库解析失败" || result.Snapshot.SyncStatus != repository.StatusFailed {
+	if result.Job.Status != repository.StatusFailed || result.Job.ErrorMessage != "代码文件解析失败" || result.Snapshot.SyncStatus != repository.StatusFailed {
 		t.Fatalf("Parser 失败状态未脱敏或不完整：%#v %#v", result.Job, result.Snapshot)
 	}
 	cached, found, lookupErr := store.FindByIdempotencyKey(context.Background(), scope, key)
@@ -1325,7 +1319,7 @@ func TestServicePersistsParserFailure(t *testing.T) {
 func TestServiceRecordsUnsupportedFilesWithoutReading(t *testing.T) {
 	sha := "1111111111111111111111111111111111111111"
 	git := &fakeGit{commits: map[string]string{"main": sha}, files: map[string]map[string][]byte{sha: {
-		"main.go": []byte("package main"), "lib.rs": []byte("fn main() {}"),
+		"service.cs": []byte("class Service {}"),
 	}}}
 	publisher := &collectingPublisher{}
 	service, err := repositoryapp.New(git, parseradapter.DefaultRegistry(), memory.NewRepositoryStore(), publisher, recordingObserver{}, &sequenceIDs{}, fixedClock{}, repositoryapp.DefaultConfig())
@@ -1338,7 +1332,7 @@ func TestServiceRecordsUnsupportedFilesWithoutReading(t *testing.T) {
 	if syncErr != nil {
 		t.Fatal(syncErr)
 	}
-	if len(result.SkippedFiles) != 2 || result.SkippedFiles[0].Path != "lib.rs" || result.SkippedFiles[1].Path != "main.go" {
+	if len(result.SkippedFiles) != 1 || result.SkippedFiles[0].Path != "service.cs" {
 		t.Fatalf("未支持文件记录不完整：%#v", result.SkippedFiles)
 	}
 	for _, skipped := range result.SkippedFiles {
@@ -1350,7 +1344,7 @@ func TestServiceRecordsUnsupportedFilesWithoutReading(t *testing.T) {
 		t.Fatalf("未支持文件不应读取 Blob，reads=%d", git.ReadCount())
 	}
 	events := publisher.Events()
-	if len(events) != 1 || events[0].Payload["skipped_count"] != 2 {
+	if len(events) != 1 || events[0].Payload["skipped_count"] != 1 {
 		t.Fatalf("完成事件应包含跳过数量：%#v", events)
 	}
 }
@@ -1390,10 +1384,7 @@ func TestFailureProgressIncludesAlreadyInspectedChanges(t *testing.T) {
 	currentSHA := "1111111111111111111111111111111111111111"
 	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}
 	store := memory.NewRepositoryStore()
-	base := repository.ParseResult{Snapshot: repository.Snapshot{
-		EntityMeta: repository.NewMeta("base", scope, repository.StatusSucceeded, fixedClock{}.Now()),
-		SnapshotID: "base", CommitSHA: baseSHA, SyncStatus: repository.StatusSucceeded,
-	}}
+	base := successfulBaseline(scope, "base", baseSHA)
 	if err := store.SaveResult(context.Background(), "base", base); err != nil {
 		t.Fatal(err)
 	}
@@ -1557,10 +1548,10 @@ func TestServicePersistsSanitizedFailure(t *testing.T) {
 	store := memory.NewRepositoryStore()
 	ids := &sequenceIDs{}
 	service, _ := repositoryapp.New(git, parseradapter.DefaultRegistry(), store, nil, nil, ids, fixedClock{}, repositoryapp.DefaultConfig())
-	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo"}
+	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"}
 	cmd := repository.SyncCommand{Scope: scope, RepositoryPath: "ignored", Ref: "main", IdempotencyKey: "failure"}
 	result, err := service.Sync(context.Background(), cmd)
-	if err == nil || result.Job.Status != repository.StatusFailed || result.Job.ErrorMessage != "仓库解析失败" {
+	if err == nil || result.Job.Status != repository.StatusFailed || result.Job.ErrorMessage != "读取仓库文件失败" {
 		t.Fatalf("失败信息未脱敏或未持久化：result=%#v err=%v", result, err)
 	}
 	cached, ok, lookupErr := store.FindByIdempotencyKey(context.Background(), scope, "failure")
@@ -1626,7 +1617,7 @@ func TestServiceDoesNotReuseMutableRefResultAfterRefMoves(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := repository.SyncCommand{
-		Scope:          common.Scope{TenantID: "tenant", RepositoryID: "repo"},
+		Scope:          common.Scope{TenantID: "tenant", RepositoryID: "repo", TraceID: "trace"},
 		RepositoryPath: "ignored",
 		Ref:            "main",
 		IdempotencyKey: "repo:main",
@@ -1643,7 +1634,11 @@ func TestServiceDoesNotReuseMutableRefResultAfterRefMoves(t *testing.T) {
 	git.commits["main"] = sha2
 	second, err := service.Sync(context.Background(), cmd)
 	if err != nil {
-		t.Fatal(err)
+		var conflict *repository.DomainError
+		if !errors.As(err, &conflict) || conflict.Operation != "idempotency_conflict" || conflict.Retryable {
+			t.Fatalf("ref 移动后应执行新命令或返回明确幂等冲突：%v", err)
+		}
+		return
 	}
 	// 工程预期不能静默返回 sha1 的缓存结果，至少应解析到 sha2 或报告幂等冲突。
 	if second.Snapshot.CommitSHA != sha2 {

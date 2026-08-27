@@ -191,7 +191,7 @@ func TestRepositoryGraphWikiIntegration(t *testing.T) {
 	mainRef := common.SourceRef{CommitSHA: commit, Path: "cmd/api/main.go", SymbolID: "main", StartLine: 1, EndLine: 10, ContentHash: "sha256:main"}
 	helperRef := common.SourceRef{CommitSHA: commit, Path: "internal/app.go", SymbolID: "run", StartLine: 5, EndLine: 20, ContentHash: "sha256:run"}
 	parseStore := memory.NewRepositoryStore()
-	parsed := repository.ParseResult{Snapshot: repository.Snapshot{EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID}, SnapshotID: scope.SnapshotID, CommitSHA: commit, SyncStatus: repository.StatusSucceeded},
+	parsed := repository.ParseResult{Snapshot: repository.Snapshot{EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID, Status: string(repository.StatusSucceeded)}, SnapshotID: scope.SnapshotID, CommitSHA: commit, SyncStatus: repository.StatusSucceeded}, Job: repository.ParseJob{EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID, Status: string(repository.StatusSucceeded)}, JobID: "parse-job", SnapshotID: scope.SnapshotID, Status: repository.StatusSucceeded, Progress: 100},
 		Artifacts: []repository.CodeArtifact{
 			{ArtifactID: "main", Kind: repository.ArtifactFunction, Name: "main", QualifiedName: "cmd.api.main", Language: "go", SourceRef: mainRef, ContentHash: mainRef.ContentHash, Attributes: map[string]string{"language": "go"}},
 			{ArtifactID: "run", Kind: repository.ArtifactFunction, Name: "run", QualifiedName: "internal.run", Language: "go", SourceRef: helperRef, ContentHash: helperRef.ContentHash, Attributes: map[string]string{"language": "go"}},

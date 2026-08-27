@@ -3,16 +3,61 @@ package memory
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/reposense/reposense/internal/domain/common"
 	"github.com/reposense/reposense/internal/domain/repository"
 )
 
+func TestTaskLeaseExpiryAllowsCrashRecoveryAndPendingCancellation(t *testing.T) {
+	store := NewRepositoryStore()
+	now := time.Now().UTC()
+	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo-lease", TraceID: "trace"}
+	if err := store.BindRepository(context.Background(), repository.RepositoryBinding{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID, Provider: "local", CanonicalIdentity: "local:/repo", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	task := repository.ParseTask{Command: repository.SyncCommand{Scope: scope, RepositoryPath: ".", Ref: "main", IdempotencyKey: "key"}, CommandFingerprint: "fingerprint", RepositoryIdentity: "local:/repo", Attempt: 1,
+		Job:      repository.ParseJob{EntityMeta: repository.NewMeta("job", scope, repository.StatusPending, now), JobID: "job", SnapshotID: "snap", ParserVersion: "test", Scope: repository.ScopeFull, Status: repository.StatusPending},
+		Snapshot: repository.Snapshot{EntityMeta: repository.NewMeta("snap", scope, repository.StatusPending, now), SnapshotID: "snap", Provider: "local", Ref: "main", SyncStatus: repository.StatusPending, ChangedPaths: []repository.ChangedPath{}}}
+	if _, created, err := store.AcquireIdempotency(context.Background(), task); err != nil || !created {
+		t.Fatalf("acquire created=%v err=%v", created, err)
+	}
+	claimed, found, err := store.ClaimPendingJob(context.Background(), "worker-1", time.Millisecond)
+	if err != nil || !found || claimed.LeaseOwner != "worker-1" {
+		t.Fatalf("首次领取失败：%#v %v", claimed, err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	recovered, found, err := store.ClaimPendingJob(context.Background(), "worker-2", time.Second)
+	if err != nil || !found || recovered.Job.JobID != "job" || recovered.LeaseOwner != "worker-2" {
+		t.Fatalf("租约接管失败：%#v %v", recovered, err)
+	}
+
+	second := task
+	second.Command.Scope.RepositoryID = "repo-cancel"
+	second.Command.IdempotencyKey = "cancel-key"
+	second.Job = repository.ParseJob{EntityMeta: repository.NewMeta("job-cancel", second.Command.Scope, repository.StatusPending, now), JobID: "job-cancel", SnapshotID: "snap-cancel", ParserVersion: "test", Scope: repository.ScopeFull, Status: repository.StatusPending}
+	second.Snapshot = repository.Snapshot{EntityMeta: repository.NewMeta("snap-cancel", second.Command.Scope, repository.StatusPending, now), SnapshotID: "snap-cancel", Provider: "local", Ref: "main", SyncStatus: repository.StatusPending, ChangedPaths: []repository.ChangedPath{}}
+	if err := store.BindRepository(context.Background(), repository.RepositoryBinding{TenantID: "tenant", RepositoryID: "repo-cancel", Provider: "local", CanonicalIdentity: "local:/cancel", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.AcquireIdempotency(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RequestCancel(context.Background(), second.Command.Scope, "job-cancel"); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, err := store.TaskByJobID(context.Background(), second.Command.Scope, "job-cancel")
+	if err != nil || cancelled.Job.Status != repository.StatusCancelled {
+		t.Fatalf("pending 取消失败：%#v %v", cancelled, err)
+	}
+}
+
 func TestStoreIsolatesTenantsAndReturnsDefensiveCopies(t *testing.T) {
 	store := NewRepositoryStore()
 	ctx := context.Background()
 	result := repository.ParseResult{
-		Snapshot:  repository.Snapshot{EntityMeta: common.EntityMeta{TenantID: "tenant-a", RepositoryID: "repo"}, SnapshotID: "snap", CommitSHA: "sha", SyncStatus: repository.StatusSucceeded, ChangedPaths: []repository.ChangedPath{{Path: "a.py", Kind: repository.ChangeAdded}}},
+		Snapshot:  repository.Snapshot{EntityMeta: common.EntityMeta{TenantID: "tenant-a", RepositoryID: "repo", Status: string(repository.StatusSucceeded)}, SnapshotID: "snap", CommitSHA: "sha", SyncStatus: repository.StatusSucceeded, ChangedPaths: []repository.ChangedPath{{Path: "a.py", Kind: repository.ChangeAdded}}},
+		Job:       repository.ParseJob{EntityMeta: common.EntityMeta{TenantID: "tenant-a", RepositoryID: "repo", Status: string(repository.StatusSucceeded)}, JobID: "job", SnapshotID: "snap", Status: repository.StatusSucceeded, Progress: 100},
 		Artifacts: []repository.CodeArtifact{{ArtifactID: "a", Attributes: map[string]string{"async": "true"}}}, Event: common.EventEnvelope{Payload: map[string]any{"deleted_paths": []string{"old.py"}}},
 	}
 	if err := store.SaveResult(ctx, "key", result); err != nil {
@@ -38,7 +83,7 @@ func TestStoreIsolatesTenantsAndReturnsDefensiveCopies(t *testing.T) {
 func TestArtifactsUsesBoundedCursorPagination(t *testing.T) {
 	store := NewRepositoryStore()
 	scope := common.Scope{TenantID: "t", RepositoryID: "r", SnapshotID: "snap"}
-	result := repository.ParseResult{Snapshot: repository.Snapshot{EntityMeta: common.EntityMeta{TenantID: "t", RepositoryID: "r"}, SnapshotID: "snap", CommitSHA: "sha", SyncStatus: repository.StatusSucceeded}, Artifacts: []repository.CodeArtifact{{ArtifactID: "1"}, {ArtifactID: "2"}, {ArtifactID: "3"}}}
+	result := repository.ParseResult{Snapshot: repository.Snapshot{EntityMeta: common.EntityMeta{TenantID: "t", RepositoryID: "r", Status: string(repository.StatusSucceeded)}, SnapshotID: "snap", CommitSHA: "sha", SyncStatus: repository.StatusSucceeded}, Job: repository.ParseJob{EntityMeta: common.EntityMeta{TenantID: "t", RepositoryID: "r", Status: string(repository.StatusSucceeded)}, JobID: "job", SnapshotID: "snap", Status: repository.StatusSucceeded, Progress: 100}, Artifacts: []repository.CodeArtifact{{ArtifactID: "1"}, {ArtifactID: "2"}, {ArtifactID: "3"}}}
 	if err := store.SaveResult(context.Background(), "key", result); err != nil {
 		t.Fatal(err)
 	}
@@ -90,8 +135,8 @@ func TestArtifactsRejectsFailedSnapshot(t *testing.T) {
 	store := NewRepositoryStore()
 	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", SnapshotID: "failed-snapshot"}
 	result := repository.ParseResult{
-		Snapshot:  repository.Snapshot{EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID, Status: string(repository.StatusFailed)}, SnapshotID: scope.SnapshotID, CommitSHA: "sha", SyncStatus: repository.StatusFailed},
-		Job:       repository.ParseJob{EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID, Status: string(repository.StatusFailed)}, JobID: "failed-job", SnapshotID: scope.SnapshotID, Status: repository.StatusFailed},
+		Snapshot:  repository.Snapshot{EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID, Status: string(repository.StatusFailed)}, SnapshotID: scope.SnapshotID, CommitSHA: "sha", SyncStatus: repository.StatusFailed, ErrorCode: string(repository.ErrParseFailure), ErrorMessage: "代码文件解析失败"},
+		Job:       repository.ParseJob{EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID, Status: string(repository.StatusFailed)}, JobID: "failed-job", SnapshotID: scope.SnapshotID, Status: repository.StatusFailed, ErrorCode: string(repository.ErrParseFailure), ErrorMessage: "代码文件解析失败"},
 		Artifacts: []repository.CodeArtifact{{ArtifactID: "partial-artifact", Kind: repository.ArtifactFunction, Name: "partial"}},
 	}
 	if err := store.SaveResult(context.Background(), "failed-key", result); err != nil {
