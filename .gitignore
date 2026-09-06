@@ -10,3 +10,6 @@ web/dist/
 /MODULE_DATA_DESIGN.md
 /PROJECT_DEFINITION.md
 /TECH_STACK_SELECTION.md
+
+# Markdown documentation is kept local only
+*.md
