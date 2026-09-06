@@ -72,8 +72,8 @@ func (s *GraphRepository) Save(ctx context.Context, key string, revision graph.R
 	ik := graphIdempotencyKey(scope, key)
 	if existingID, ok := s.idempotency[ik]; ok {
 		existing := s.revisions[existingID]
-		if existing.SnapshotID != revision.SnapshotID {
-			return &graph.DomainError{Code: graph.ErrConflict, Operation: "save_revision", Message: "idempotency key already used for another snapshot"}
+		if existing.RequestFingerprint != revision.RequestFingerprint {
+			return &graph.DomainError{Code: graph.ErrConflict, Operation: "save_revision", Stage: "save_revision", Message: "idempotency key already used for another graph request"}
 		}
 		return nil
 	}
@@ -118,46 +118,46 @@ func (s *GraphRepository) Query(ctx context.Context, q graph.Query) (graph.Resul
 	}
 	relationAllowed := relationTypeSet(q.RelationTypes)
 	entityAllowed := entityTypeSet(q.EntityTypes)
-	selected := map[string]bool{}
-	frontier := make([]string, 0, len(q.RootIDs))
+	ordered := []string{}
+	distances := map[string]int{}
 	if len(q.RootIDs) == 0 {
 		ids := make([]string, 0, len(nodes))
-		for id := range nodes {
-			ids = append(ids, id)
+		for id, node := range nodes {
+			if entityMatches(node, entityAllowed) && !diagnosticNode(node) {
+				ids = append(ids, id)
+			}
 		}
 		sort.Strings(ids)
-		for _, id := range ids {
-			if len(selected) >= limit {
-				break
-			}
-			if entityMatches(nodes[id], entityAllowed) {
-				selected[id] = true
-			}
-		}
+		ordered = ids
 	} else {
+		rootSet := map[string]struct{}{}
 		for _, root := range q.RootIDs {
-			id := root
-			if _, ok := nodes[id]; !ok {
-				id = artifactToNode[root]
-			}
+			id := artifactToNode[root]
 			if id == "" {
-				continue
+				return graph.Result{}, &graph.DomainError{Code: graph.ErrInvalidInput, Operation: "resolve_roots", Stage: "resolve_roots", Message: "root artifact was not found"}
 			}
-			if !selected[id] {
-				selected[id] = true
-				frontier = append(frontier, id)
+			if !entityMatches(nodes[id], entityAllowed) || diagnosticNode(nodes[id]) {
+				return graph.Result{}, &graph.DomainError{Code: graph.ErrInvalidInput, Operation: "resolve_roots", Stage: "resolve_roots", Message: "root artifact is excluded by the query"}
 			}
+			rootSet[id] = struct{}{}
 		}
-		if len(frontier) == 0 {
-			return graph.Result{}, &graph.DomainError{Code: graph.ErrInvalidInput, Operation: "resolve_roots", Message: "no root node or artifact was found"}
+		if len(rootSet) > limit {
+			return graph.Result{}, &graph.DomainError{Code: graph.ErrInvalidInput, Operation: "resolve_roots", Stage: "resolve_roots", Message: "root count exceeds query limit"}
 		}
-		for depth := 0; depth < q.Depth && len(frontier) > 0 && len(selected) < limit; depth++ {
-			next := []string{}
+		frontier := make([]string, 0, len(rootSet))
+		for id := range rootSet {
+			frontier = append(frontier, id)
+			distances[id] = 0
+		}
+		sort.Strings(frontier)
+		ordered = append(ordered, frontier...)
+		for depth := 0; depth < q.Depth && len(frontier) > 0; depth++ {
+			nextSet := map[string]struct{}{}
 			for _, edge := range revision.Edges {
 				if err := ctx.Err(); err != nil {
 					return graph.Result{}, err
 				}
-				if !relationMatches(edge, relationAllowed) {
+				if diagnosticRelation(edge) || !relationMatches(edge, relationAllowed) {
 					continue
 				}
 				for _, current := range frontier {
@@ -168,34 +168,54 @@ func (s *GraphRepository) Query(ctx context.Context, q graph.Query) (graph.Resul
 					if (direction == graph.DirectionBoth || direction == graph.DirectionIncoming) && edge.ToNodeID == current {
 						neighbor = edge.FromNodeID
 					}
-					if neighbor != "" && !selected[neighbor] && len(selected) < limit {
-						selected[neighbor] = true
-						next = append(next, neighbor)
+					if neighbor != "" {
+						if _, seen := distances[neighbor]; seen {
+							continue
+						}
+						node, exists := nodes[neighbor]
+						if !exists || diagnosticNode(node) || !entityMatches(node, entityAllowed) {
+							continue
+						}
+						nextSet[neighbor] = struct{}{}
 					}
 				}
 			}
+			next := make([]string, 0, len(nextSet))
+			for id := range nextSet {
+				distances[id] = depth + 1
+				next = append(next, id)
+			}
+			sort.Strings(next)
+			ordered = append(ordered, next...)
 			frontier = next
 		}
 	}
-	result := graph.Result{Diagnostics: graph.Diagnostics{RevisionID: revision.RevisionID, Visited: len(selected), DurationMS: time.Since(started).Milliseconds()}}
-	for id := range selected {
-		if node, ok := nodes[id]; ok && entityMatches(node, entityAllowed) {
-			result.Nodes = append(result.Nodes, cloneEntity(node))
-		}
+	visited := len(ordered)
+	truncated := len(ordered) > limit
+	if truncated {
+		ordered = ordered[:limit]
 	}
+	result := graph.Result{Diagnostics: graph.Diagnostics{RevisionID: revision.RevisionID, Visited: visited, Truncated: truncated, DurationMS: time.Since(started).Milliseconds()}}
 	visible := map[string]bool{}
-	for _, node := range result.Nodes {
-		visible[node.NodeID] = true
+	for _, id := range ordered {
+		result.Nodes = append(result.Nodes, cloneEntity(nodes[id]))
+		visible[id] = true
 	}
 	for _, edge := range revision.Edges {
-		if visible[edge.FromNodeID] && visible[edge.ToNodeID] && relationMatches(edge, relationAllowed) {
+		if !diagnosticRelation(edge) && visible[edge.FromNodeID] && visible[edge.ToNodeID] && relationMatches(edge, relationAllowed) {
 			result.Edges = append(result.Edges, cloneRelation(edge))
 		}
 	}
-	sort.Slice(result.Nodes, func(i, j int) bool { return result.Nodes[i].NodeID < result.Nodes[j].NodeID })
 	sort.Slice(result.Edges, func(i, j int) bool { return result.Edges[i].EdgeID < result.Edges[j].EdgeID })
-	result.Diagnostics.Truncated = len(selected) >= limit && len(selected) < len(nodes)
 	return result, nil
+}
+
+func diagnosticRelation(edge graph.Relation) bool {
+	return edge.RelationType == repository.RelationKind("UNCERTAIN_RELATION") || edge.RelationType == repository.RelationKind("POSSIBLE_TARGET")
+}
+
+func diagnosticNode(node graph.Entity) bool {
+	return node.Properties != nil && node.Properties["resolution"] != ""
 }
 
 func relationTypeSet(values []repository.RelationKind) map[repository.RelationKind]bool {

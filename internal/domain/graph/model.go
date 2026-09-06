@@ -20,9 +20,10 @@ const (
 type RevisionStatus string
 
 const (
-	RevisionBuilding RevisionStatus = "BUILDING"
-	RevisionActive   RevisionStatus = "ACTIVE"
-	RevisionFailed   RevisionStatus = "FAILED"
+	RevisionBuilding   RevisionStatus = "BUILDING"
+	RevisionActive     RevisionStatus = "ACTIVE"
+	RevisionFailed     RevisionStatus = "FAILED"
+	RevisionSuperseded RevisionStatus = "SUPERSEDED"
 )
 
 type EntityType string
@@ -61,21 +62,20 @@ func (c BuildCommand) Validate() error {
 	if err := c.Scope.Validate(true); err != nil {
 		return err
 	}
-	if c.Mode != BuildFull && c.Mode != BuildIncremental {
-		return fmt.Errorf("mode must be FULL or INCREMENTAL")
+	if hasSurroundingSpace(c.Scope.TenantID) || hasSurroundingSpace(c.Scope.RepositoryID) || hasSurroundingSpace(c.Scope.SnapshotID) {
+		return fmt.Errorf("scope identity fields must not contain surrounding whitespace")
+	}
+	if c.Mode != BuildFull {
+		return fmt.Errorf("graph builds only support FULL mode")
 	}
 	if strings.TrimSpace(c.IdempotencyKey) == "" {
 		return fmt.Errorf("idempotency_key must not be empty")
 	}
-	seen := make(map[string]struct{}, len(c.ArtifactIDs))
-	for _, id := range c.ArtifactIDs {
-		if strings.TrimSpace(id) == "" {
-			return fmt.Errorf("artifact_ids must not contain empty values")
-		}
-		if _, ok := seen[id]; ok {
-			return fmt.Errorf("duplicate artifact_id %q", id)
-		}
-		seen[id] = struct{}{}
+	if hasSurroundingSpace(c.IdempotencyKey) {
+		return fmt.Errorf("idempotency_key must not contain surrounding whitespace")
+	}
+	if len(c.ArtifactIDs) != 0 {
+		return fmt.Errorf("partial graph builds are not supported")
 	}
 	return nil
 }
@@ -111,17 +111,23 @@ type RevisionStats struct {
 
 type Revision struct {
 	common.EntityMeta
-	RevisionID       string               `json:"revision_id"`
-	SnapshotID       string               `json:"snapshot_id"`
-	ParentRevisionID string               `json:"parent_revision_id,omitempty"`
-	CommitSHA        string               `json:"commit_sha"`
-	BuildMode        BuildMode            `json:"build_mode"`
-	BuildStatus      RevisionStatus       `json:"build_status"`
-	AlgorithmVersion string               `json:"algorithm_version"`
-	Stats            RevisionStats        `json:"stats"`
-	Nodes            []Entity             `json:"-"`
-	Edges            []Relation           `json:"-"`
-	PublishedEvent   common.EventEnvelope `json:"-"`
+	RevisionID          string               `json:"revision_id"`
+	SnapshotID          string               `json:"snapshot_id"`
+	ParentRevisionID    string               `json:"parent_revision_id,omitempty"`
+	CommitSHA           string               `json:"commit_sha"`
+	BuildMode           BuildMode            `json:"build_mode"`
+	BuildStatus         RevisionStatus       `json:"build_status"`
+	AlgorithmVersion    string               `json:"algorithm_version"`
+	ParserResultVersion string               `json:"parser_result_version,omitempty"`
+	GraphSchemaVersion  string               `json:"graph_schema_version,omitempty"`
+	BuildPolicyVersion  string               `json:"build_policy_version,omitempty"`
+	QualityStatus       QualityStatus        `json:"quality_status,omitempty"`
+	Quality             QualityStats         `json:"quality"`
+	RequestFingerprint  string               `json:"request_fingerprint"`
+	Stats               RevisionStats        `json:"stats"`
+	Nodes               []Entity             `json:"-"`
+	Edges               []Relation           `json:"-"`
+	PublishedEvent      common.EventEnvelope `json:"-"`
 }
 
 type Query struct {
@@ -146,6 +152,16 @@ func (q Query) Validate() error {
 	}
 	if q.Direction != "" && q.Direction != DirectionBoth && q.Direction != DirectionIncoming && q.Direction != DirectionOutgoing {
 		return fmt.Errorf("invalid direction %q", q.Direction)
+	}
+	for _, entityType := range q.EntityTypes {
+		if !validEntityType(entityType) {
+			return fmt.Errorf("invalid entity type %q", entityType)
+		}
+	}
+	for _, relationType := range q.RelationTypes {
+		if !validRelationType(relationType) {
+			return fmt.Errorf("invalid relation type %q", relationType)
+		}
 	}
 	return nil
 }
@@ -182,4 +198,24 @@ func NewMeta(id string, scope common.Scope, status RevisionStatus, now time.Time
 	return common.EntityMeta{ID: id, TenantID: scope.TenantID, RepositoryID: scope.RepositoryID,
 		SchemaVersion: 1, Status: string(status), Version: 1, CreatedAt: now.UTC(), UpdatedAt: now.UTC(),
 		CreatedBy: "svc_knowledge_graph", TraceID: scope.TraceID, Classification: "CONFIDENTIAL"}
+}
+
+func hasSurroundingSpace(value string) bool { return value != strings.TrimSpace(value) }
+
+func validEntityType(value EntityType) bool {
+	switch value {
+	case EntityRepository, EntityModule, EntityFile, EntityClass, EntityInterface, EntityFunction, EntityMethod, EntityImport, EntityConfig, EntityDocument, EntityPackage, EntitySymbol:
+		return true
+	default:
+		return false
+	}
+}
+
+func validRelationType(value repository.RelationKind) bool {
+	switch value {
+	case repository.RelationContains, repository.RelationImports, repository.RelationCalls, repository.RelationExtends, repository.RelationImplements, repository.RelationDependsOn:
+		return true
+	default:
+		return false
+	}
 }
