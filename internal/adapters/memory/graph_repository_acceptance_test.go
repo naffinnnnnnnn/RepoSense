@@ -17,7 +17,7 @@ func TestAcceptanceQueryRejectsMoreRootsThanLimit(t *testing.T) {
 
 func TestAcceptanceQueryRejectsAnyMissingRoot(t *testing.T) {
 	store, scope := acceptanceGraph(t)
-	_, err := store.Query(context.Background(), graph.Query{Scope: scope, RootIDs: []string{"n1", "missing"}, Depth: 1, Limit: 10})
+	_, err := store.Query(context.Background(), graph.Query{Scope: scope, RootIDs: []string{"a1", "missing"}, Depth: 1, Limit: 10})
 	assertMemoryGraphCode(t, err, graph.ErrInvalidInput)
 }
 
@@ -37,7 +37,7 @@ func TestAcceptanceQueryRejectsUnknownFilters(t *testing.T) {
 
 func TestAcceptanceQueryRejectsRootExcludedByEntityFilter(t *testing.T) {
 	store, scope := acceptanceGraph(t)
-	_, err := store.Query(context.Background(), graph.Query{Scope: scope, RootIDs: []string{"n1"}, EntityTypes: []graph.EntityType{graph.EntityClass}, Depth: 1, Limit: 10})
+	_, err := store.Query(context.Background(), graph.Query{Scope: scope, RootIDs: []string{"a1"}, EntityTypes: []graph.EntityType{graph.EntityClass}, Depth: 1, Limit: 10})
 	assertMemoryGraphCode(t, err, graph.ErrInvalidInput)
 }
 
@@ -63,7 +63,7 @@ func TestAcceptanceTruncatedOnlyReportsEligibleReachableOmissions(t *testing.T) 
 	if err := store.Save(context.Background(), "key", revision); err != nil {
 		t.Fatal(err)
 	}
-	result, err := store.Query(context.Background(), graph.Query{Scope: scope, RootIDs: []string{"n1"}, Depth: 10, Limit: 1})
+	result, err := store.Query(context.Background(), graph.Query{Scope: scope, RootIDs: []string{"a1"}, Depth: 10, Limit: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestAcceptanceTruncatedOnlyReportsEligibleReachableOmissions(t *testing.T) 
 
 func TestAcceptanceTruncatedIsTrueWhenReachableNodeWasOmitted(t *testing.T) {
 	store, scope := acceptanceGraph(t)
-	result, err := store.Query(context.Background(), graph.Query{Scope: scope, RootIDs: []string{"n1"}, Direction: graph.DirectionOutgoing, Depth: 2, Limit: 1})
+	result, err := store.Query(context.Background(), graph.Query{Scope: scope, RootIDs: []string{"a1"}, Direction: graph.DirectionOutgoing, Depth: 2, Limit: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,5 +110,104 @@ func assertMemoryGraphCode(t *testing.T, err error, code graph.ErrorCode) {
 	t.Helper()
 	if !graph.IsCode(err, code) {
 		t.Fatalf("expected graph error %s, got %v", code, err)
+	}
+}
+
+func TestAcceptanceQueryRejectsInternalNodeIDRoot(t *testing.T) {
+	store, scope := acceptanceGraph(t)
+	_, err := store.Query(context.Background(), graph.Query{Scope: scope, RootIDs: []string{"n1"}, Depth: 0, Limit: 10})
+	assertMemoryGraphCode(t, err, graph.ErrInvalidInput)
+}
+
+func TestAcceptanceEntityFilterStopsTraversal(t *testing.T) {
+	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", SnapshotID: "entity-filter"}
+	store := NewGraphRepository()
+	revision := graph.Revision{
+		EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID},
+		RevisionID: "revision-entity-filter", SnapshotID: scope.SnapshotID, BuildStatus: graph.RevisionActive,
+		Nodes: []graph.Entity{
+			{NodeID: "root", ArtifactID: "root-artifact", EntityType: graph.EntityFunction, Name: "root"},
+			{NodeID: "middle", ArtifactID: "middle-artifact", EntityType: graph.EntityClass, Name: "middle"},
+			{NodeID: "hidden-child", ArtifactID: "child-artifact", EntityType: graph.EntityFunction, Name: "child"},
+		},
+		Edges: []graph.Relation{
+			{EdgeID: "e1", RelationType: repository.RelationCalls, FromNodeID: "root", ToNodeID: "middle"},
+			{EdgeID: "e2", RelationType: repository.RelationCalls, FromNodeID: "middle", ToNodeID: "hidden-child"},
+		},
+	}
+	if err := store.Save(context.Background(), "entity-filter", revision); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := store.Query(context.Background(), graph.Query{
+		Scope: scope, RootIDs: []string{"root-artifact"}, EntityTypes: []graph.EntityType{graph.EntityFunction}, Depth: 2, Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Nodes) != 1 || result.Nodes[0].ArtifactID != "root-artifact" || len(result.Edges) != 0 {
+		t.Fatalf("entity filter must stop traversal through excluded nodes: %#v", result)
+	}
+}
+
+func TestAcceptanceDiagnosticRelationsAreExcludedByDefault(t *testing.T) {
+	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", SnapshotID: "diagnostic"}
+	store := NewGraphRepository()
+	revision := graph.Revision{
+		EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID},
+		RevisionID: "revision-diagnostic", SnapshotID: scope.SnapshotID, BuildStatus: graph.RevisionActive,
+		Nodes: []graph.Entity{
+			{NodeID: "root", ArtifactID: "root-artifact", EntityType: graph.EntityFunction, Name: "root"},
+			{NodeID: "issue", EntityType: graph.EntitySymbol, Name: "unresolved target", Properties: map[string]string{"resolution": "UNRESOLVED"}},
+		},
+		Edges: []graph.Relation{
+			{EdgeID: "uncertain", RelationType: repository.RelationKind("UNCERTAIN_RELATION"), FromNodeID: "root", ToNodeID: "issue"},
+		},
+	}
+	if err := store.Save(context.Background(), "diagnostic", revision); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := store.Query(context.Background(), graph.Query{Scope: scope, RootIDs: []string{"root-artifact"}, Depth: 1, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Nodes) != 1 || len(result.Edges) != 0 {
+		t.Fatalf("business query leaked diagnostic graph: %#v", result)
+	}
+}
+
+func TestAcceptanceQueryOrdersNodesByDistanceThenNodeID(t *testing.T) {
+	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", SnapshotID: "ordering"}
+	store := NewGraphRepository()
+	revision := graph.Revision{
+		EntityMeta: common.EntityMeta{TenantID: scope.TenantID, RepositoryID: scope.RepositoryID},
+		RevisionID: "revision-ordering", SnapshotID: scope.SnapshotID, BuildStatus: graph.RevisionActive,
+		Nodes: []graph.Entity{
+			{NodeID: "root", ArtifactID: "root-artifact", EntityType: graph.EntityFunction, Name: "root"},
+			{NodeID: "z-depth-one", ArtifactID: "one", EntityType: graph.EntityFunction, Name: "one"},
+			{NodeID: "a-depth-two", ArtifactID: "two", EntityType: graph.EntityFunction, Name: "two"},
+		},
+		Edges: []graph.Relation{
+			{EdgeID: "e1", RelationType: repository.RelationCalls, FromNodeID: "root", ToNodeID: "z-depth-one"},
+			{EdgeID: "e2", RelationType: repository.RelationCalls, FromNodeID: "z-depth-one", ToNodeID: "a-depth-two"},
+		},
+	}
+	if err := store.Save(context.Background(), "ordering", revision); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := store.Query(context.Background(), graph.Query{Scope: scope, RootIDs: []string{"root-artifact"}, Direction: graph.DirectionOutgoing, Depth: 2, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"root", "z-depth-one", "a-depth-two"}
+	if len(result.Nodes) != len(want) {
+		t.Fatalf("nodes=%#v want=%#v", result.Nodes, want)
+	}
+	for i := range want {
+		if result.Nodes[i].NodeID != want[i] {
+			t.Fatalf("node order=%#v want=%#v", result.Nodes, want)
+		}
 	}
 }

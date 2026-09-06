@@ -26,7 +26,7 @@ func TestGraphRepositoryQueryIsolationFilteringAndCopies(t *testing.T) {
 		t.Fatalf("unexpected projection: %#v", result)
 	}
 	result.Nodes[0].Properties["x"] = "mutated"
-	again, err := store.Query(context.Background(), graph.Query{Scope: scope, RootIDs: []string{"n1"}, Depth: 0})
+	again, err := store.Query(context.Background(), graph.Query{Scope: scope, RootIDs: []string{"a1"}, Depth: 0})
 	if err != nil {
 		t.Fatal(err)
 	}

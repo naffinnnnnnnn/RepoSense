@@ -185,7 +185,7 @@ func TestAcceptanceIncrementalBuildRejectsArtifactSelection(t *testing.T) {
 	storeParseResult(t, repositories, "parse-child", childInput)
 
 	_, err = service.Build(context.Background(), graph.BuildCommand{Scope: childScope, Mode: graph.BuildIncremental, ArtifactIDs: []string{childInput.Artifacts[0].ArtifactID}, IdempotencyKey: "child"})
-	assertGraphCode(t, err, graph.ErrInvalidInput)
+	assertGraphCode(t, err, graph.ErrUnsupportedBuildMode)
 }
 
 func TestAcceptanceIdempotencyKeyCannotBeReusedAcrossSnapshots(t *testing.T) {
@@ -216,7 +216,7 @@ func TestAcceptanceIdempotencyKeyCannotBeReusedForDifferentBuildRequest(t *testi
 	}
 
 	_, err := service.Build(context.Background(), graph.BuildCommand{Scope: scope, Mode: graph.BuildFull, ArtifactIDs: []string{input.Artifacts[0].ArtifactID}, IdempotencyKey: "shared-key"})
-	assertGraphCode(t, err, graph.ErrConflict)
+	assertGraphCode(t, err, graph.ErrPartialBuildNotAllowed)
 }
 func TestAcceptanceConcurrentIdempotentBuildReturnsOnlyPersistedWinner(t *testing.T) {
 	scope := acceptanceScope("concurrent")
@@ -350,5 +350,47 @@ func assertNoPublishedRevision(t *testing.T, service *Service, scope common.Scop
 	_, err := service.Query(context.Background(), graph.Query{Scope: scope, Limit: 1})
 	if !graph.IsCode(err, graph.ErrRevisionNotFound) {
 		t.Fatalf("failed build published a revision: %v", err)
+	}
+}
+
+func TestAcceptanceFullBuildRejectsArtifactSelection(t *testing.T) {
+	scope := acceptanceScope("partial-full")
+	input := validBuildInput(scope, "commit-a")
+	service := newAcceptanceService(t, acceptanceSource{input: input}, memory.NewGraphRepository(), nil)
+
+	_, err := service.Build(context.Background(), graph.BuildCommand{
+		Scope: scope, Mode: graph.BuildFull, ArtifactIDs: []string{input.Artifacts[0].ArtifactID}, IdempotencyKey: "partial-full",
+	})
+	assertGraphCode(t, err, graph.ErrPartialBuildNotAllowed)
+	assertNoPublishedRevision(t, service, scope)
+}
+
+func TestAcceptanceIncrementalBuildIsUnsupported(t *testing.T) {
+	scope := acceptanceScope("incremental-unsupported")
+	input := validBuildInput(scope, "commit-a")
+	service := newAcceptanceService(t, acceptanceSource{input: input}, memory.NewGraphRepository(), nil)
+
+	_, err := service.Build(context.Background(), graph.BuildCommand{
+		Scope: scope, Mode: graph.BuildIncremental, IdempotencyKey: "incremental",
+	})
+	assertGraphCode(t, err, graph.ErrUnsupportedBuildMode)
+	assertNoPublishedRevision(t, service, scope)
+}
+
+func TestAcceptanceGraphDoesNotGuessInternalTargetByQualifiedName(t *testing.T) {
+	scope := acceptanceScope("no-name-resolution")
+	input := validBuildInput(scope, "commit-a")
+	target := input.Artifacts[1]
+	input.Relations[0].To = target.QualifiedName
+	service := newAcceptanceService(t, acceptanceSource{input: input}, memory.NewGraphRepository(), nil)
+
+	revision, err := service.Build(context.Background(), graph.BuildCommand{Scope: scope, Mode: graph.BuildFull, IdempotencyKey: "no-name-resolution"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range revision.Edges {
+		if edge.ToNodeID == nodeID(target.ArtifactID) {
+			t.Fatalf("Graph guessed Parser target from qualified name: %#v", edge)
+		}
 	}
 }

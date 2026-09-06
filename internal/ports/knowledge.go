@@ -2,6 +2,7 @@ package ports
 
 import (
 	"context"
+	"time"
 
 	"github.com/reposense/reposense/internal/domain/agent"
 	"github.com/reposense/reposense/internal/domain/assistant"
@@ -16,6 +17,52 @@ import (
 // 以下 DTO 在编译期明确后续模块的边界，具体实现不属于当前里程碑。
 type GraphSource interface {
 	GraphInput(context.Context, common.Scope) (graph.BuildInput, error)
+}
+
+// PagedGraphSource is the versioned production contract consumed from the
+// Repository Parser. GraphSource remains as a compatibility seam for the
+// in-memory development service while production orchestration migrates.
+type PagedGraphSource interface {
+	SnapshotMetadata(context.Context, common.Scope) (graph.SnapshotMetadata, error)
+	ArtifactPage(context.Context, common.Scope, string, int) (graph.ArtifactPage, error)
+	RelationPage(context.Context, common.Scope, string, int) (graph.RelationPage, error)
+}
+
+type GraphBuildStore interface {
+	EnqueueGraphBuild(context.Context, graph.BuildJob) (graph.BuildJob, bool, error)
+	GraphJob(context.Context, string) (graph.BuildJob, error)
+	ClaimGraphBuild(context.Context, string, string, string, time.Time, time.Duration) (graph.BuildJob, graph.BuildAttempt, bool, error)
+	HeartbeatGraphBuild(context.Context, string, string, string, int64, time.Time) error
+	FailGraphAttempt(context.Context, graph.BuildJob, graph.BuildAttempt, graph.DomainError, time.Time) error
+	ActivateGraphRevision(context.Context, graph.BuildJob, graph.BuildAttempt, graph.Revision, common.EventEnvelope, time.Time) error
+	ActiveGraphRevision(context.Context, common.Scope) (graph.Revision, error)
+}
+
+type GraphDataRepository interface {
+	CreateCandidate(context.Context, graph.BuildJob, graph.BuildAttempt) error
+	WriteArtifactBatch(context.Context, graph.BuildJob, graph.BuildAttempt, []repository.CodeArtifact) error
+	WriteRelationBatch(context.Context, graph.BuildJob, graph.BuildAttempt, []graph.ResolvedRelation) error
+	SealCandidate(context.Context, graph.BuildJob, graph.BuildAttempt, graph.RevisionStats, graph.QualityStatus) error
+	CandidateStatus(context.Context, common.Scope, string) (graph.CandidateStatus, error)
+	QueryRevision(context.Context, string, graph.Query) (graph.Result, error)
+	DeleteCandidate(context.Context, common.Scope, string, int64) error
+}
+
+type GraphOutboxStore interface {
+	PendingGraphEvents(context.Context, int, time.Time) ([]graph.OutboxRecord, error)
+	MarkGraphEventPublished(context.Context, string, time.Time) error
+	MarkGraphEventFailed(context.Context, string, string, time.Time, bool) error
+}
+
+type GraphRejectedEventStore interface {
+	RecordRejectedGraphEvent(context.Context, graph.RejectedEvent) (bool, error)
+}
+
+type GraphReconciliationStore interface {
+	ExpiredGraphAttempts(context.Context, time.Time, int) ([]graph.BuildAttempt, error)
+	MarkGraphAttemptLost(context.Context, string, string, int64, time.Time) error
+	UnreferencedGraphCandidates(context.Context, time.Time, int) ([]graph.BuildAttempt, error)
+	RecordGraphReconciliationRun(context.Context, graph.ReconciliationRun) error
 }
 
 type GraphRepository interface {
