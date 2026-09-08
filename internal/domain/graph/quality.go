@@ -28,6 +28,13 @@ type QualityStats struct {
 	InvalidRelations int64            `json:"invalid_relations"`
 	ResolutionCounts map[string]int64 `json:"resolution_counts,omitempty"`
 	ErrorCounts      map[string]int64 `json:"error_counts,omitempty"`
+	ErrorSamples     []QualitySample  `json:"error_samples,omitempty"`
+}
+
+type QualitySample struct {
+	RecordType string `json:"record_type"`
+	RecordID   string `json:"record_id"`
+	ErrorCode  string `json:"error_code"`
 }
 
 func (s QualityStats) Validate() error {

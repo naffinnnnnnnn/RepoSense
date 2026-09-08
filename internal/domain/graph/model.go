@@ -144,6 +144,9 @@ func (q Query) Validate() error {
 	if err := q.Scope.Validate(true); err != nil {
 		return err
 	}
+	if hasSurroundingSpace(q.Scope.TenantID) || hasSurroundingSpace(q.Scope.RepositoryID) || hasSurroundingSpace(q.Scope.SnapshotID) {
+		return fmt.Errorf("scope identity fields must not contain surrounding whitespace")
+	}
 	if q.Depth < 0 || q.Depth > 10 {
 		return fmt.Errorf("depth must be between 0 and 10")
 	}
@@ -163,6 +166,11 @@ func (q Query) Validate() error {
 			return fmt.Errorf("invalid relation type %q", relationType)
 		}
 	}
+	for _, rootID := range q.RootIDs {
+		if strings.TrimSpace(rootID) == "" || hasSurroundingSpace(rootID) {
+			return fmt.Errorf("root_ids must contain exact non-empty artifact ids")
+		}
+	}
 	return nil
 }
 
@@ -177,6 +185,52 @@ type Result struct {
 	Nodes       []Entity    `json:"nodes"`
 	Edges       []Relation  `json:"edges"`
 	Diagnostics Diagnostics `json:"diagnostics"`
+}
+
+type DiagnosticQuery struct {
+	Scope       common.Scope `json:"scope"`
+	ArtifactIDs []string     `json:"artifact_ids"`
+	Limit       int          `json:"limit"`
+}
+
+func (q DiagnosticQuery) Validate() error {
+	if err := q.Scope.Validate(true); err != nil {
+		return err
+	}
+	if hasSurroundingSpace(q.Scope.TenantID) || hasSurroundingSpace(q.Scope.RepositoryID) || hasSurroundingSpace(q.Scope.SnapshotID) {
+		return fmt.Errorf("scope identity fields must not contain surrounding whitespace")
+	}
+	if len(q.ArtifactIDs) == 0 {
+		return fmt.Errorf("at least one artifact_id is required")
+	}
+	if q.Limit < 0 || q.Limit > 10_000 {
+		return fmt.Errorf("limit must be between 0 and 10000")
+	}
+	for _, artifactID := range q.ArtifactIDs {
+		if strings.TrimSpace(artifactID) == "" || hasSurroundingSpace(artifactID) {
+			return fmt.Errorf("artifact_ids must not contain empty values")
+		}
+	}
+	return nil
+}
+
+type ResolutionIssue struct {
+	IssueID              string                  `json:"issue_id"`
+	RelationID           string                  `json:"relation_id"`
+	SourceArtifactID     string                  `json:"source_artifact_id"`
+	IntendedKind         repository.RelationKind `json:"intended_kind"`
+	ResolutionStatus     ResolutionStatus        `json:"resolution_status"`
+	RawTargetSymbol      string                  `json:"raw_target_symbol"`
+	ReasonCode           string                  `json:"reason_code"`
+	Confidence           float64                 `json:"confidence"`
+	Evidence             common.SourceRef        `json:"evidence"`
+	CandidateArtifactIDs []string                `json:"candidate_artifact_ids,omitempty"`
+}
+
+type DiagnosticResult struct {
+	RevisionID string            `json:"revision_id"`
+	Issues     []ResolutionIssue `json:"issues"`
+	Truncated  bool              `json:"truncated"`
 }
 
 type BuildInput struct {

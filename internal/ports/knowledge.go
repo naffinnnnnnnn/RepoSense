@@ -41,11 +41,16 @@ type GraphBuildStore interface {
 type GraphDataRepository interface {
 	CreateCandidate(context.Context, graph.BuildJob, graph.BuildAttempt) error
 	WriteArtifactBatch(context.Context, graph.BuildJob, graph.BuildAttempt, []repository.CodeArtifact) error
+	CompleteArtifactStage(context.Context, graph.BuildJob, graph.BuildAttempt, int) error
 	WriteRelationBatch(context.Context, graph.BuildJob, graph.BuildAttempt, []graph.ResolvedRelation) error
 	SealCandidate(context.Context, graph.BuildJob, graph.BuildAttempt, graph.RevisionStats, graph.QualityStatus) error
 	CandidateStatus(context.Context, common.Scope, string) (graph.CandidateStatus, error)
 	QueryRevision(context.Context, string, graph.Query) (graph.Result, error)
 	DeleteCandidate(context.Context, common.Scope, string, int64) error
+}
+
+type GraphDiagnosticsRepository interface {
+	QueryRevisionDiagnostics(context.Context, string, graph.DiagnosticQuery) (graph.DiagnosticResult, error)
 }
 
 type GraphOutboxStore interface {

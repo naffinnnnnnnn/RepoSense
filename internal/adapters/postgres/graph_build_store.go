@@ -220,11 +220,16 @@ func (s *GraphControlStore) HeartbeatGraphBuild(ctx context.Context, jobID, atte
 	}
 	tag, err := s.pool.Exec(ctx, `UPDATE graph_build_attempts SET lease_expires_at=$5,updated_at=CURRENT_TIMESTAMP
 WHERE job_id=$1 AND attempt_id=$2 AND lease_owner=$3 AND fence=$4 AND status='RUNNING'
-  AND lease_expires_at>CURRENT_TIMESTAMP AND $5>CURRENT_TIMESTAMP`, jobID, attemptID, owner, fence, expiresAt.UTC())
+  AND lease_expires_at>CURRENT_TIMESTAMP AND $5>CURRENT_TIMESTAMP
+  AND EXISTS (SELECT 1 FROM graph_build_jobs j WHERE j.job_id=$1 AND j.cancel_requested=false)`, jobID, attemptID, owner, fence, expiresAt.UTC())
 	if err != nil {
 		return controlStoreError("heartbeat", err)
 	}
 	if tag.RowsAffected() != 1 {
+		var cancelRequested bool
+		if err := s.pool.QueryRow(ctx, `SELECT cancel_requested FROM graph_build_jobs WHERE job_id=$1`, jobID).Scan(&cancelRequested); err == nil && cancelRequested {
+			return &graph.DomainError{Code: graph.ErrBuildCancelled, Operation: "heartbeat", Stage: "control", Dependency: "postgresql", Message: "graph build was cancelled", Retryable: false}
+		}
 		return leaseLostError("heartbeat")
 	}
 	return nil
@@ -240,19 +245,23 @@ func (s *GraphControlStore) FailGraphAttempt(ctx context.Context, job graph.Buil
 		return controlStoreError("fail_attempt", err)
 	}
 	defer tx.Rollback(ctx)
-	tag, err := tx.Exec(ctx, `UPDATE graph_build_attempts SET status='FAILED',error_code=$6,
+	attemptStatus, jobStatus := graph.AttemptFailed, graph.JobFailed
+	if failure.Code == graph.ErrBuildCancelled {
+		attemptStatus, jobStatus = graph.AttemptCancelled, graph.JobCancelled
+	}
+	tag, err := tx.Exec(ctx, `UPDATE graph_build_attempts SET status=$9,error_code=$6,
 error_message=$7,retryable=$8,updated_at=$5 WHERE job_id=$1 AND attempt_id=$2
 AND lease_owner=$3 AND fence=$4 AND status='RUNNING' AND lease_expires_at>$5`, job.JobID,
-		attempt.AttemptID, attempt.LeaseOwner, attempt.Fence, now, failure.Code, failure.Message, failure.Retryable)
+		attempt.AttemptID, attempt.LeaseOwner, attempt.Fence, now, failure.Code, failure.Message, failure.Retryable, attemptStatus)
 	if err != nil {
 		return controlStoreError("fail_attempt_update", err)
 	}
 	if tag.RowsAffected() != 1 {
 		return leaseLostError("fail_attempt")
 	}
-	tag, err = tx.Exec(ctx, `UPDATE graph_build_jobs SET status='FAILED',error_code=$3,error_message=$4,
+	tag, err = tx.Exec(ctx, `UPDATE graph_build_jobs SET status=$7,error_code=$3,error_message=$4,
 retryable=$5,updated_at=$6 WHERE job_id=$1 AND status='BUILDING' AND revision_id=$2`, job.JobID,
-		attempt.RevisionID, failure.Code, failure.Message, failure.Retryable, now)
+		attempt.RevisionID, failure.Code, failure.Message, failure.Retryable, now, jobStatus)
 	if err != nil {
 		return controlStoreError("fail_job_update", err)
 	}
