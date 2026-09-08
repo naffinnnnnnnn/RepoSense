@@ -22,6 +22,7 @@ type GraphDataStore struct {
 var _ ports.GraphDataRepository = (*GraphDataStore)(nil)
 var _ ports.GraphDiagnosticsRepository = (*GraphDataStore)(nil)
 var _ ports.GraphReconciliationDataRepository = (*GraphDataStore)(nil)
+var _ ports.GraphProductionQueryRepository = (*GraphDataStore)(nil)
 
 type GraphDataConfig struct {
 	MaxRoots           int

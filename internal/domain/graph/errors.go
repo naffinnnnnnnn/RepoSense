@@ -35,6 +35,8 @@ const (
 	ErrBuildCancelled           ErrorCode = "BUILD_CANCELLED"
 	ErrWorkerShutdown           ErrorCode = "WORKER_SHUTDOWN"
 	ErrBuildTimeout             ErrorCode = "BUILD_TIMEOUT"
+	ErrQueryCancelled           ErrorCode = "QUERY_CANCELLED"
+	ErrQueryTimeout             ErrorCode = "QUERY_TIMEOUT"
 	ErrEventPublishFailed       ErrorCode = "EVENT_PUBLISH_FAILED"
 )
 
