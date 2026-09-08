@@ -39,3 +39,8 @@ type ReconciliationRun struct {
 	StartedAt    time.Time `json:"started_at"`
 	CompletedAt  time.Time `json:"completed_at"`
 }
+
+type ActiveRevisionRef struct {
+	Scope      common.Scope `json:"scope"`
+	RevisionID string       `json:"revision_id"`
+}

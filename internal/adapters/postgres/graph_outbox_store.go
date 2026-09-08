@@ -48,6 +48,60 @@ ORDER BY next_attempt_at,created_at,event_id LIMIT $2`, dueAt.UTC(), limit)
 	return records, nil
 }
 
+func (s *GraphControlStore) ClaimGraphEvents(ctx context.Context, limit int, dueAt, leaseUntil time.Time) ([]graph.OutboxRecord, error) {
+	if limit <= 0 || limit > 1000 || dueAt.IsZero() || !leaseUntil.After(dueAt) {
+		return nil, invalidControlInput("outbox claim requires a limit between 1 and 1000 and an ordered lease window")
+	}
+	rows, err := s.pool.Query(ctx, `WITH selected AS (
+  SELECT event_id FROM graph_outbox_events
+  WHERE published_at IS NULL AND dead_lettered_at IS NULL AND next_attempt_at<=$1
+  ORDER BY next_attempt_at,created_at,event_id
+  FOR UPDATE SKIP LOCKED LIMIT $2
+), claimed AS (
+  UPDATE graph_outbox_events o SET next_attempt_at=$3,updated_at=$1
+  FROM selected s WHERE o.event_id=s.event_id
+  RETURNING o.tenant_id,o.repository_id,o.snapshot_id,o.revision_id,o.event_id,
+    o.event_type,o.aggregate_id,o.occurred_at,o.producer,o.payload_version,o.trace_id,o.payload,
+    o.delivery_count,o.next_attempt_at,COALESCE(o.last_error,''),o.created_at
+)
+SELECT * FROM claimed ORDER BY created_at,event_id`, dueAt.UTC(), limit, leaseUntil.UTC())
+	if err != nil {
+		return nil, controlStoreError("claim_outbox", err)
+	}
+	defer rows.Close()
+	return scanGraphOutboxRecords(rows)
+}
+
+type graphOutboxRows interface {
+	Next() bool
+	Scan(...any) error
+	Err() error
+}
+
+func scanGraphOutboxRecords(rows graphOutboxRows) ([]graph.OutboxRecord, error) {
+	records := make([]graph.OutboxRecord, 0)
+	for rows.Next() {
+		var record graph.OutboxRecord
+		var payloadJSON []byte
+		if err := rows.Scan(&record.Scope.TenantID, &record.Scope.RepositoryID, &record.Scope.SnapshotID,
+			&record.RevisionID, &record.Event.EventID, &record.Event.EventType,
+			&record.Event.AggregateID, &record.Event.OccurredAt, &record.Event.Producer,
+			&record.Event.PayloadVersion, &record.Event.TraceID, &payloadJSON,
+			&record.DeliveryCount, &record.NextAttemptAt, &record.LastError, &record.CreatedAt); err != nil {
+			return nil, controlStoreError("scan_outbox", err)
+		}
+		if err := json.Unmarshal(payloadJSON, &record.Event.Payload); err != nil {
+			return nil, controlStoreError("decode_outbox", err)
+		}
+		record.Scope.TraceID = record.Event.TraceID
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, controlStoreError("scan_outbox", err)
+	}
+	return records, nil
+}
+
 func (s *GraphControlStore) MarkGraphEventPublished(ctx context.Context, eventID string, publishedAt time.Time) error {
 	if strings.TrimSpace(eventID) == "" || publishedAt.IsZero() {
 		return invalidControlInput("event_id and published_at are required")
@@ -130,19 +184,26 @@ WHERE job_id=$1 AND attempt_id=$2 AND fence=$3 AND status='RUNNING' AND lease_ex
 	return nil
 }
 
-func (s *GraphControlStore) UnreferencedGraphCandidates(ctx context.Context, before time.Time, limit int) ([]graph.BuildAttempt, error) {
-	if before.IsZero() || limit <= 0 || limit > 1000 {
-		return nil, invalidControlInput("orphan cutoff and a limit between 1 and 1000 are required")
+func (s *GraphControlStore) UnreferencedGraphCandidates(ctx context.Context, before, now time.Time, limit int) ([]graph.BuildAttempt, error) {
+	if before.IsZero() || now.IsZero() || !before.Before(now) || limit <= 0 || limit > 1000 {
+		return nil, invalidControlInput("ordered orphan cutoff/current time and a limit between 1 and 1000 are required")
 	}
 	rows, err := s.pool.Query(ctx, `SELECT a.attempt_id,a.job_id,a.revision_id,a.status,a.lease_owner,
 a.lease_expires_at,a.fence,a.created_at,a.updated_at FROM graph_build_attempts a
-JOIN graph_build_jobs j ON j.job_id=a.job_id
 LEFT JOIN graph_revisions r ON r.revision_id=a.revision_id
 LEFT JOIN graph_active_revisions ar ON ar.revision_id=a.revision_id
-WHERE a.status IN ('FAILED','LOST','CANCELLED') AND a.updated_at<=$1
+WHERE a.status IN ('FAILED','LOST','CANCELLED') AND a.updated_at<=$1 AND a.lease_expires_at<=$2
 AND r.revision_id IS NULL AND ar.revision_id IS NULL
-AND NOT (j.status IN ('PENDING','BUILDING','SUCCEEDED') AND j.revision_id=a.revision_id)
-ORDER BY a.updated_at,a.attempt_id LIMIT $2`, before.UTC(), limit)
+AND NOT EXISTS (
+  SELECT 1 FROM graph_build_jobs live_job
+  WHERE live_job.revision_id=a.revision_id AND live_job.status IN ('PENDING','BUILDING','SUCCEEDED')
+)
+AND NOT EXISTS (
+  SELECT 1 FROM graph_build_attempts live_attempt
+  WHERE live_attempt.revision_id=a.revision_id
+    AND live_attempt.status='RUNNING' AND live_attempt.lease_expires_at>$2
+)
+ORDER BY a.updated_at,a.attempt_id LIMIT $3`, before.UTC(), now.UTC(), limit)
 	if err != nil {
 		return nil, controlStoreError("unreferenced_candidates", err)
 	}
@@ -203,4 +264,28 @@ VALUES($1,$2,$3,$4,$5,NULLIF($6,''),NULLIF($7,''),$8,$9)`, run.RunID, run.Action
 		return controlStoreError("record_reconciliation_run", err)
 	}
 	return nil
+}
+
+func (s *GraphControlStore) ActiveGraphRevisionRefs(ctx context.Context, afterRevisionID string, limit int) ([]graph.ActiveRevisionRef, error) {
+	if limit <= 0 || limit > 1000 {
+		return nil, invalidControlInput("active revision limit must be between 1 and 1000")
+	}
+	rows, err := s.pool.Query(ctx, `SELECT tenant_id,repository_id,snapshot_id,revision_id
+FROM graph_active_revisions WHERE revision_id>$1 ORDER BY revision_id LIMIT $2`, afterRevisionID, limit)
+	if err != nil {
+		return nil, controlStoreError("active_revision_refs", err)
+	}
+	defer rows.Close()
+	refs := make([]graph.ActiveRevisionRef, 0)
+	for rows.Next() {
+		var ref graph.ActiveRevisionRef
+		if err := rows.Scan(&ref.Scope.TenantID, &ref.Scope.RepositoryID, &ref.Scope.SnapshotID, &ref.RevisionID); err != nil {
+			return nil, controlStoreError("scan_active_revision_ref", err)
+		}
+		refs = append(refs, ref)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, controlStoreError("active_revision_refs", err)
+	}
+	return refs, nil
 }

@@ -26,6 +26,8 @@ func RequestFingerprint(input FingerprintInput) (string, error) {
 	if err := input.Versions.Validate(); err != nil {
 		return "", err
 	}
+	// Trace correlation is operational metadata, not logical build identity.
+	input.Scope.TraceID = ""
 	data, err := json.Marshal(input)
 	if err != nil {
 		return "", fmt.Errorf("encode fingerprint input: %w", err)

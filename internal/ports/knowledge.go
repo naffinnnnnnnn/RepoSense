@@ -38,6 +38,10 @@ type GraphBuildStore interface {
 	ActiveGraphRevision(context.Context, common.Scope) (graph.Revision, error)
 }
 
+type GraphBuildAdmissionStore interface {
+	EnqueueGraphBuildWithinQuota(context.Context, graph.BuildJob, int, int) (graph.BuildJob, bool, error)
+}
+
 type GraphDataRepository interface {
 	CreateCandidate(context.Context, graph.BuildJob, graph.BuildAttempt) error
 	WriteArtifactBatch(context.Context, graph.BuildJob, graph.BuildAttempt, []repository.CodeArtifact) error
@@ -53,8 +57,18 @@ type GraphDiagnosticsRepository interface {
 	QueryRevisionDiagnostics(context.Context, string, graph.DiagnosticQuery) (graph.DiagnosticResult, error)
 }
 
+// GraphReconciliationDataRepository is deliberately narrower than the worker
+// data-plane port. Reconciliation may inspect and remove candidates, but it
+// must not write graph contents or run business queries.
+type GraphReconciliationDataRepository interface {
+	CandidateStatus(context.Context, common.Scope, string) (graph.CandidateStatus, error)
+	VerifyRevision(context.Context, graph.Revision) error
+	DeleteCandidate(context.Context, common.Scope, string, int64) error
+}
+
 type GraphOutboxStore interface {
 	PendingGraphEvents(context.Context, int, time.Time) ([]graph.OutboxRecord, error)
+	ClaimGraphEvents(context.Context, int, time.Time, time.Time) ([]graph.OutboxRecord, error)
 	MarkGraphEventPublished(context.Context, string, time.Time) error
 	MarkGraphEventFailed(context.Context, string, string, time.Time, bool) error
 }
@@ -66,8 +80,14 @@ type GraphRejectedEventStore interface {
 type GraphReconciliationStore interface {
 	ExpiredGraphAttempts(context.Context, time.Time, int) ([]graph.BuildAttempt, error)
 	MarkGraphAttemptLost(context.Context, string, string, int64, time.Time) error
-	UnreferencedGraphCandidates(context.Context, time.Time, int) ([]graph.BuildAttempt, error)
+	UnreferencedGraphCandidates(context.Context, time.Time, time.Time, int) ([]graph.BuildAttempt, error)
+	ActiveGraphRevisionRefs(context.Context, string, int) ([]graph.ActiveRevisionRef, error)
 	RecordGraphReconciliationRun(context.Context, graph.ReconciliationRun) error
+}
+
+type GraphReconciliationBuildStore interface {
+	GraphJob(context.Context, string) (graph.BuildJob, error)
+	ActiveGraphRevision(context.Context, common.Scope) (graph.Revision, error)
 }
 
 type GraphRepository interface {
