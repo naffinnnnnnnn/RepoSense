@@ -6,6 +6,7 @@ require (
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/nats-io/nats.go v1.53.1
+	github.com/neo4j/neo4j-go-driver/v6 v6.2.0
 )
 
 require (
