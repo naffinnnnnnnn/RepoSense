@@ -57,6 +57,22 @@ type GraphDiagnosticsRepository interface {
 	QueryRevisionDiagnostics(context.Context, string, graph.DiagnosticQuery) (graph.DiagnosticResult, error)
 }
 
+// GraphActiveRevisionStore is the read-only control-plane boundary used by
+// production queries. PostgreSQL is authoritative for the exact revision that
+// may be served for a snapshot.
+type GraphActiveRevisionStore interface {
+	ActiveGraphRevision(context.Context, common.Scope) (graph.Revision, error)
+}
+
+// GraphProductionQueryRepository is the immutable Neo4j read boundary. The
+// caller must resolve the revision in the control plane and verify its complete
+// metadata before issuing either a fact-graph or diagnostics query.
+type GraphProductionQueryRepository interface {
+	VerifyRevision(context.Context, graph.Revision) error
+	QueryRevision(context.Context, string, graph.Query) (graph.Result, error)
+	QueryRevisionDiagnostics(context.Context, string, graph.DiagnosticQuery) (graph.DiagnosticResult, error)
+}
+
 // GraphReconciliationDataRepository is deliberately narrower than the worker
 // data-plane port. Reconciliation may inspect and remove candidates, but it
 // must not write graph contents or run business queries.

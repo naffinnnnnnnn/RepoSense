@@ -25,6 +25,7 @@ var (
 	_ ports.GraphRejectedEventStore       = (*GraphControlStore)(nil)
 	_ ports.GraphReconciliationStore      = (*GraphControlStore)(nil)
 	_ ports.GraphReconciliationBuildStore = (*GraphControlStore)(nil)
+	_ ports.GraphActiveRevisionStore      = (*GraphControlStore)(nil)
 )
 
 func NewGraphControlStore(ctx context.Context, dsn string) (*GraphControlStore, error) {
