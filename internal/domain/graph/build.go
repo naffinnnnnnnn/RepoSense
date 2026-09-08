@@ -191,6 +191,7 @@ type BuildJob struct {
 	JobID              string        `json:"job_id"`
 	Scope              common.Scope  `json:"scope"`
 	IdempotencyKey     string        `json:"idempotency_key"`
+	TriggerEventID     string        `json:"trigger_event_id,omitempty"`
 	RequestFingerprint string        `json:"request_fingerprint"`
 	CommitSHA          string        `json:"commit_sha"`
 	Versions           BuildVersions `json:"versions"`

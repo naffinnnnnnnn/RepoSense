@@ -35,6 +35,7 @@ const (
 	ErrBuildCancelled           ErrorCode = "BUILD_CANCELLED"
 	ErrWorkerShutdown           ErrorCode = "WORKER_SHUTDOWN"
 	ErrBuildTimeout             ErrorCode = "BUILD_TIMEOUT"
+	ErrEventPublishFailed       ErrorCode = "EVENT_PUBLISH_FAILED"
 )
 
 type DomainError struct {

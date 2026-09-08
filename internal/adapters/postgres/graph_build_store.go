@@ -19,10 +19,12 @@ import (
 type GraphControlStore struct{ pool *pgxpool.Pool }
 
 var (
-	_ ports.GraphBuildStore          = (*GraphControlStore)(nil)
-	_ ports.GraphOutboxStore         = (*GraphControlStore)(nil)
-	_ ports.GraphRejectedEventStore  = (*GraphControlStore)(nil)
-	_ ports.GraphReconciliationStore = (*GraphControlStore)(nil)
+	_ ports.GraphBuildStore               = (*GraphControlStore)(nil)
+	_ ports.GraphBuildAdmissionStore      = (*GraphControlStore)(nil)
+	_ ports.GraphOutboxStore              = (*GraphControlStore)(nil)
+	_ ports.GraphRejectedEventStore       = (*GraphControlStore)(nil)
+	_ ports.GraphReconciliationStore      = (*GraphControlStore)(nil)
+	_ ports.GraphReconciliationBuildStore = (*GraphControlStore)(nil)
 )
 
 func NewGraphControlStore(ctx context.Context, dsn string) (*GraphControlStore, error) {
@@ -52,6 +54,17 @@ func (s *GraphControlStore) Close() {
 }
 
 func (s *GraphControlStore) EnqueueGraphBuild(ctx context.Context, requested graph.BuildJob) (graph.BuildJob, bool, error) {
+	return s.enqueueGraphBuild(ctx, requested, 0, 0)
+}
+
+func (s *GraphControlStore) EnqueueGraphBuildWithinQuota(ctx context.Context, requested graph.BuildJob, maxGlobalPending, maxTenantPending int) (graph.BuildJob, bool, error) {
+	if maxGlobalPending <= 0 || maxTenantPending <= 0 || maxTenantPending > maxGlobalPending {
+		return graph.BuildJob{}, false, invalidControlInput("pending graph build quotas must be positive and tenant quota must not exceed global quota")
+	}
+	return s.enqueueGraphBuild(ctx, requested, maxGlobalPending, maxTenantPending)
+}
+
+func (s *GraphControlStore) enqueueGraphBuild(ctx context.Context, requested graph.BuildJob, maxGlobalPending, maxTenantPending int) (graph.BuildJob, bool, error) {
 	if err := validateEnqueueJob(requested); err != nil {
 		return graph.BuildJob{}, false, err
 	}
@@ -64,15 +77,50 @@ func (s *GraphControlStore) EnqueueGraphBuild(ctx context.Context, requested gra
 		return graph.BuildJob{}, false, controlStoreError("enqueue", err)
 	}
 	defer tx.Rollback(ctx)
+	if maxGlobalPending > 0 {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('graph-build-admission',0))`); err != nil {
+			return graph.BuildJob{}, false, controlStoreError("admission_lock", err)
+		}
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "graph-build-tenant:"+requested.Scope.TenantID); err != nil {
+			return graph.BuildJob{}, false, controlStoreError("tenant_admission_lock", err)
+		}
+		var existing bool
+		var boundFingerprint string
+		bindingErr := tx.QueryRow(ctx, `SELECT request_fingerprint FROM graph_idempotency
+WHERE tenant_id=$1 AND repository_id=$2 AND idempotency_key=$3`, requested.Scope.TenantID, requested.Scope.RepositoryID, requested.IdempotencyKey).Scan(&boundFingerprint)
+		if bindingErr == nil {
+			if boundFingerprint != requested.RequestFingerprint {
+				return graph.BuildJob{}, false, idempotencyConflict("idempotency key is already bound to a different graph build")
+			}
+			existing = true
+		} else if !errors.Is(bindingErr, pgx.ErrNoRows) {
+			return graph.BuildJob{}, false, controlStoreError("admission_idempotency", bindingErr)
+		}
+		var fingerprintExists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM graph_build_jobs WHERE request_fingerprint=$1)`, requested.RequestFingerprint).Scan(&fingerprintExists); err != nil {
+			return graph.BuildJob{}, false, controlStoreError("admission_existing", err)
+		}
+		existing = existing || fingerprintExists
+		if !existing {
+			var globalPending, tenantPending int
+			if err := tx.QueryRow(ctx, `SELECT count(*),count(*) FILTER (WHERE tenant_id=$1)
+FROM graph_build_jobs WHERE status IN ('PENDING','BUILDING')`, requested.Scope.TenantID).Scan(&globalPending, &tenantPending); err != nil {
+				return graph.BuildJob{}, false, controlStoreError("admission_count", err)
+			}
+			if globalPending >= maxGlobalPending || tenantPending >= maxTenantPending {
+				return graph.BuildJob{}, false, &graph.DomainError{Code: graph.ErrBuildCapacityExceeded, Operation: "enqueue", Stage: "admission", Dependency: "postgresql", Message: "graph build pending quota is exhausted", Retryable: true}
+			}
+		}
+	}
 
 	tag, err := tx.Exec(ctx, `INSERT INTO graph_build_jobs(
-job_id,tenant_id,repository_id,snapshot_id,idempotency_key,request_fingerprint,commit_sha,
+job_id,tenant_id,repository_id,snapshot_id,idempotency_key,trigger_event_id,request_fingerprint,commit_sha,
 parser_result_version,graph_schema_version,graph_algorithm_version,build_policy_version,
 status,revision_id,event_id,trace_id,created_at,updated_at)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'PENDING',NULL,$12,$13,$14,$15)
+VALUES($1,$2,$3,$4,$5,NULLIF($6,''),$7,$8,$9,$10,$11,$12,'PENDING',NULL,$13,$14,$15,$16)
 ON CONFLICT(request_fingerprint) DO NOTHING`, requested.JobID, requested.Scope.TenantID,
 		requested.Scope.RepositoryID, requested.Scope.SnapshotID, requested.IdempotencyKey,
-		requested.RequestFingerprint, requested.CommitSHA, requested.Versions.ParserResultVersion,
+		requested.TriggerEventID, requested.RequestFingerprint, requested.CommitSHA, requested.Versions.ParserResultVersion,
 		requested.Versions.GraphSchemaVersion, requested.Versions.GraphAlgorithmVersion,
 		requested.Versions.BuildPolicyVersion, requested.EventID, requested.Scope.TraceID, requested.CreatedAt, requested.UpdatedAt)
 	if err != nil {
@@ -403,7 +451,7 @@ WHERE a.tenant_id=$1 AND a.repository_id=$2 AND a.snapshot_id=$3`, scope.TenantI
 	return revision, nil
 }
 
-const graphJobSelect = `SELECT job_id,tenant_id,repository_id,snapshot_id,idempotency_key,
+const graphJobSelect = `SELECT job_id,tenant_id,repository_id,snapshot_id,idempotency_key,COALESCE(trigger_event_id,''),
 request_fingerprint,commit_sha,parser_result_version,graph_schema_version,graph_algorithm_version,
 build_policy_version,status,COALESCE(revision_id,''),event_id,trace_id,created_at,updated_at FROM graph_build_jobs`
 
@@ -417,7 +465,7 @@ func scanGraphJob(row pgx.Row) (graph.BuildJob, error) {
 	var job graph.BuildJob
 	var status string
 	err := row.Scan(&job.JobID, &job.Scope.TenantID, &job.Scope.RepositoryID, &job.Scope.SnapshotID,
-		&job.IdempotencyKey, &job.RequestFingerprint, &job.CommitSHA, &job.Versions.ParserResultVersion,
+		&job.IdempotencyKey, &job.TriggerEventID, &job.RequestFingerprint, &job.CommitSHA, &job.Versions.ParserResultVersion,
 		&job.Versions.GraphSchemaVersion, &job.Versions.GraphAlgorithmVersion,
 		&job.Versions.BuildPolicyVersion, &status, &job.RevisionID, &job.EventID, &job.Scope.TraceID, &job.CreatedAt, &job.UpdatedAt)
 	job.Status = graph.JobStatus(status)
@@ -470,6 +518,9 @@ func validateEnqueueJob(job graph.BuildJob) error {
 	}
 	if strings.TrimSpace(job.JobID) == "" || strings.TrimSpace(job.IdempotencyKey) == "" || strings.TrimSpace(job.CommitSHA) == "" || strings.TrimSpace(job.EventID) == "" {
 		return invalidControlInput("job identity, idempotency key, commit and event identity are required")
+	}
+	if job.TriggerEventID != "" && strings.TrimSpace(job.TriggerEventID) != job.TriggerEventID {
+		return invalidControlInput("trigger_event_id must be an exact identity")
 	}
 	if job.CreatedAt.IsZero() || job.UpdatedAt.IsZero() {
 		return invalidControlInput("job timestamps are required")
