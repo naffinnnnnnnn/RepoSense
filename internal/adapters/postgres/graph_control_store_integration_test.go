@@ -132,7 +132,7 @@ func TestGraphControlStorePostgresLeaseRecoveryAndFencing(t *testing.T) {
 	if err := store.FailGraphAttempt(ctx, job2, attempt2, failure, expiredAt.Add(time.Second)); err != nil {
 		t.Fatalf("fail current attempt: %v", err)
 	}
-	orphans, err := store.UnreferencedGraphCandidates(ctx, expiredAt.Add(2*time.Second), expiredAt.Add(3*time.Second), 10)
+	orphans, err := store.UnreferencedGraphCandidates(ctx, expiredAt.Add(2*time.Second), attempt2.LeaseExpiresAt.Add(time.Second), 10)
 	if err != nil || len(orphans) != 2 {
 		t.Fatalf("failed and lost candidates should be reconcilable: %#v err=%v", orphans, err)
 	}

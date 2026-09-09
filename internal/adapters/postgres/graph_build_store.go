@@ -400,11 +400,11 @@ WHERE tenant_id=$1 AND repository_id=$2 AND snapshot_id=$3 FOR UPDATE`, job.Scop
 revision_id,job_id,attempt_id,tenant_id,repository_id,snapshot_id,commit_sha,request_fingerprint,
 parser_result_version,graph_schema_version,graph_algorithm_version,build_policy_version,build_mode,
 build_status,quality_status,stats,quality,event_id,trace_id,created_at,updated_at)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'FULL','ACTIVE',$13,$14,$15,$16,$17,$18,$19)`,
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'FULL','ACTIVE',$13,$14::jsonb,$15::jsonb,$16,$17,$18,$19)`,
 		revision.RevisionID, job.JobID, attempt.AttemptID, job.Scope.TenantID, job.Scope.RepositoryID,
 		job.Scope.SnapshotID, revision.CommitSHA, job.RequestFingerprint, revision.ParserResultVersion,
 		revision.GraphSchemaVersion, revision.AlgorithmVersion, revision.BuildPolicyVersion,
-		revision.QualityStatus, statsJSON, qualityJSON, event.EventID, event.TraceID, createdAt, now)
+		revision.QualityStatus, string(statsJSON), string(qualityJSON), event.EventID, event.TraceID, createdAt, now)
 	if err != nil {
 		return activationError("insert_revision", err)
 	}
@@ -434,10 +434,10 @@ WHERE job_id=$1 AND status='BUILDING' AND revision_id=$2`, job.JobID, revision.R
 	_, err = tx.Exec(ctx, `INSERT INTO graph_outbox_events(
 event_id,tenant_id,repository_id,snapshot_id,revision_id,event_type,aggregate_id,occurred_at,
 producer,payload_version,trace_id,payload,next_attempt_at,created_at,updated_at)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13,$13)`, event.EventID,
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$13,$13)`, event.EventID,
 		job.Scope.TenantID, job.Scope.RepositoryID, job.Scope.SnapshotID, revision.RevisionID,
 		event.EventType, event.AggregateID, event.OccurredAt.UTC(), event.Producer, event.PayloadVersion,
-		event.TraceID, payloadJSON, now)
+		event.TraceID, string(payloadJSON), now)
 	if err != nil {
 		return activationError("insert_outbox", err)
 	}
