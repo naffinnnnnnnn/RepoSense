@@ -1,0 +1,194 @@
+name: Code Knowledge Graph verification
+
+on:
+  pull_request:
+    paths:
+      - 'cmd/graph/**'
+      - 'internal/**/graph/**'
+      - 'internal/adapters/nats/**'
+      - 'internal/adapters/neo4j/**'
+      - 'internal/adapters/observability/**'
+      - 'internal/adapters/postgres/**'
+      - 'internal/config/graph*'
+      - 'internal/ports/knowledge.go'
+      - 'internal/ports/repository.go'
+      - 'internal/transport/hertz/graph*'
+      - 'api/events/graph.published.v1.schema.json'
+      - 'api/openapi/reposense.yaml'
+      - 'migrations/neo4j/**graph**'
+      - 'migrations/postgres/**graph**'
+      - 'test/integration/graph/**'
+      - 'test/verification/graph*'
+      - '.github/workflows/graph-verification.yml'
+      - 'go.mod'
+      - 'go.sum'
+  push:
+    branches: [main, test]
+  schedule:
+    - cron: '17 18 * * *'
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Verification profile
+        required: true
+        default: integration
+        type: choice
+        options: [integration, nightly, release]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: graph-verification-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  quick:
+    name: Graph unit, race, vet, contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test ./internal/domain/graph ./internal/application/graph ./internal/adapters/memory ./internal/adapters/neo4j ./internal/adapters/nats ./internal/adapters/observability ./internal/adapters/postgres ./internal/config ./internal/transport/hertz ./test/verification -count=1
+      - run: go test -race ./internal/domain/graph ./internal/application/graph ./internal/adapters/memory ./internal/adapters/neo4j ./internal/adapters/nats ./internal/adapters/observability ./internal/adapters/postgres ./internal/config ./internal/transport/hertz ./test/verification -count=1
+      - run: go vet ./internal/domain/graph ./internal/application/graph ./internal/adapters/memory ./internal/adapters/neo4j ./internal/adapters/nats ./internal/adapters/observability ./internal/adapters/postgres ./internal/config ./internal/transport/hertz ./test/verification
+
+  integration:
+    name: Graph PostgreSQL, Neo4j, JetStream and E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17.11-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: reposense
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d reposense"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      neo4j:
+        image: neo4j:5.26.30-community
+        env:
+          NEO4J_AUTH: neo4j/graph-password
+        ports:
+          - 7687:7687
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p graph-password 'RETURN 1'"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 30
+    env:
+      REPOSENSE_TEST_POSTGRES_DSN: postgres://postgres:postgres@localhost:5432/reposense?sslmode=disable
+      REPOSENSE_TEST_NEO4J_URI: bolt://localhost:7687
+      REPOSENSE_TEST_NEO4J_USER: neo4j
+      REPOSENSE_TEST_NEO4J_PASSWORD: graph-password
+      REPOSENSE_TEST_NEO4J_DATABASE: neo4j
+      REPOSENSE_TEST_NATS_URL: nats://localhost:4222
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Start pinned JetStream
+        run: docker run --detach --rm --name graph-nats --publish 4222:4222 nats:2.12.15-alpine -js
+      - name: Run real adapter and pipeline gates without skips
+        run: go test -tags=integration -p=1 ./internal/adapters/postgres ./internal/adapters/neo4j ./internal/adapters/nats ./test/integration/graph -run '^TestGraph' -count=1 -v
+      - name: Stop JetStream
+        if: always()
+        run: docker stop graph-nats || true
+
+  nightly:
+    name: Graph concurrent fault matrix
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.profile == 'nightly' || inputs.profile == 'release'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:17.11-alpine
+        env: { POSTGRES_USER: postgres, POSTGRES_PASSWORD: postgres, POSTGRES_DB: reposense }
+        ports: [ '5432:5432' ]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d reposense"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      neo4j:
+        image: neo4j:5.26.30-community
+        env: { NEO4J_AUTH: neo4j/graph-password }
+        ports: [ '7687:7687' ]
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p graph-password 'RETURN 1'"
+          --health-interval 10s --health-timeout 10s --health-retries 30
+    env:
+      REPOSENSE_TEST_POSTGRES_DSN: postgres://postgres:postgres@localhost:5432/reposense?sslmode=disable
+      REPOSENSE_TEST_NEO4J_URI: bolt://localhost:7687
+      REPOSENSE_TEST_NEO4J_USER: neo4j
+      REPOSENSE_TEST_NEO4J_PASSWORD: graph-password
+      REPOSENSE_TEST_NEO4J_DATABASE: neo4j
+      REPOSENSE_TEST_NATS_URL: nats://localhost:4222
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod, cache: true }
+      - run: docker run --detach --rm --name graph-nats --publish 4222:4222 nats:2.12.15-alpine -js
+      - run: go test -race -tags=integration -p=1 ./internal/adapters/postgres ./internal/adapters/neo4j ./internal/adapters/nats ./test/integration/graph -run '^TestGraph' -count=3 -v
+      - if: always()
+        run: docker stop graph-nats || true
+
+  release:
+    name: Graph release capacity and recovery evidence
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'release'
+    needs: [quick, integration, nightly]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:17.11-alpine
+        env: { POSTGRES_USER: postgres, POSTGRES_PASSWORD: postgres, POSTGRES_DB: reposense }
+        ports: [ '5432:5432' ]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d reposense"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      neo4j:
+        image: neo4j:5.26.30-community
+        env: { NEO4J_AUTH: neo4j/graph-password }
+        ports: [ '7687:7687' ]
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p graph-password 'RETURN 1'"
+          --health-interval 10s --health-timeout 10s --health-retries 30
+    env:
+      REPOSENSE_GRAPH_CAPACITY_ARTIFACTS: '1000000'
+      REPOSENSE_GRAPH_CAPACITY_MAX_DURATION: 2m
+      REPOSENSE_TEST_POSTGRES_DSN: postgres://postgres:postgres@localhost:5432/reposense?sslmode=disable
+      REPOSENSE_TEST_NEO4J_URI: bolt://localhost:7687
+      REPOSENSE_TEST_NEO4J_USER: neo4j
+      REPOSENSE_TEST_NEO4J_PASSWORD: graph-password
+      REPOSENSE_TEST_NEO4J_DATABASE: neo4j
+      REPOSENSE_TEST_NATS_URL: nats://localhost:4222
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod, cache: true }
+      - run: docker run --detach --rm --name graph-nats --publish 4222:4222 nats:2.12.15-alpine -js
+      - name: Produce auditable recovery, migration and rolling-upgrade evidence
+        run: go test -race -tags=integration -p=1 ./internal/adapters/postgres ./internal/adapters/neo4j ./internal/adapters/nats ./test/integration/graph -run '^TestGraph' -count=1 -v | tee graph-recovery-report.txt
+      - name: Produce auditable bounded-page capacity evidence
+        run: go test -tags=release ./test/verification -run '^TestGraphCapacity' -count=1 -v | tee graph-capacity-report.txt
+      - if: always()
+        run: docker stop graph-nats || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: graph-release-evidence-${{ github.sha }}
+          path: |
+            graph-capacity-report.txt
+            graph-recovery-report.txt
+          if-no-files-found: error

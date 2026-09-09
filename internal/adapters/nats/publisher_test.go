@@ -2,8 +2,6 @@ package nats
 
 import (
 	"context"
-	"fmt"
-	"os"
 	"testing"
 	"time"
 
@@ -46,40 +44,3 @@ func TestPublisherPreservesSchemaBodyAndAddsTrustedScopeHeaders(t *testing.T) {
 }
 
 func fixedTime() time.Time { return time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC) }
-
-func TestPublisherJetStreamIntegration(t *testing.T) {
-	url := os.Getenv("REPOSENSE_TEST_NATS_URL")
-	if url == "" {
-		t.Skip("REPOSENSE_TEST_NATS_URL 未配置")
-	}
-	connection, err := gonats.Connect(url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer connection.Close()
-	js, err := jetstream.New(connection)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	name := fmt.Sprintf("REPOSITORY_PARSER_TEST_%d", time.Now().UnixNano())
-	stream, err := js.CreateStream(ctx, jetstream.StreamConfig{Name: name, Subjects: []string{"parse.completed.v1"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer js.DeleteStream(context.Background(), name)
-	publisher := NewPublisher(js)
-	scope := common.Scope{TenantID: "tenant", RepositoryID: "repo", SnapshotID: "snap", TraceID: "trace"}
-	event := repository.NewParseCompletedEvent("evt-integration-"+name, scope, time.Now(), repository.ParseCompletedPayload{SnapshotID: "snap", CommitSHA: "abc", DeletedPaths: []string{}})
-	if err := publisher.Publish(repository.WithEventScope(ctx, scope), event); err != nil {
-		t.Fatal(err)
-	}
-	message, err := stream.GetMsg(ctx, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if message.Header.Get("RepoSense-Tenant-ID") != "tenant" || message.Header.Get("Nats-Msg-Id") != event.EventID {
-		t.Fatalf("JetStream 头错误：%v", message.Header)
-	}
-}
