@@ -64,6 +64,11 @@ func NewQueryService(revisions ports.GraphActiveRevisionStore, graphRepository p
 }
 
 func (s *QueryService) Query(ctx context.Context, query graph.Query) (result graph.Result, err error) {
+	ctx, finish := startGraphStage(s.observer, ctx, "graph_query", map[string]string{
+		"operation": "query", "tenant_id": query.Scope.TenantID, "repository_id": query.Scope.RepositoryID,
+		"snapshot_id": query.Scope.SnapshotID, "trace_id": query.Scope.TraceID,
+	})
+	defer func() { finish(err) }()
 	if validateErr := query.Validate(); validateErr != nil {
 		return graph.Result{}, queryError(graph.ErrInvalidInput, "validate", "request", false, "graph query is invalid", validateErr)
 	}
@@ -72,8 +77,6 @@ func (s *QueryService) Query(ctx context.Context, query graph.Query) (result gra
 	}
 	defer s.release()
 
-	finish := s.observer.Stage(ctx, "graph_query", map[string]string{"operation": "query"})
-	defer func() { finish(err) }()
 	queryCtx, cancel := context.WithTimeout(ctx, s.config.Timeout)
 	defer cancel()
 
@@ -81,19 +84,36 @@ func (s *QueryService) Query(ctx context.Context, query graph.Query) (result gra
 	if err != nil {
 		return graph.Result{}, classifyQueryContext(queryCtx, err)
 	}
-	result, err = s.graph.QueryRevision(queryCtx, revision.RevisionID, query)
+	dataCtx, finishData := startGraphStage(s.observer, queryCtx, "graph_neo4j_query", map[string]string{"operation": "query", "dependency": "neo4j", "revision_id": revision.RevisionID})
+	result, err = s.graph.QueryRevision(dataCtx, revision.RevisionID, query)
+	finishData(err)
 	if err != nil {
 		return graph.Result{}, classifyQueryContext(queryCtx, activeQueryError("query_revision", err))
 	}
 	if result.Diagnostics.RevisionID != revision.RevisionID {
 		return graph.Result{}, inconsistentQueryResult("query_revision", "neo4j", "neo4j returned a result for an unexpected graph revision", nil)
 	}
+	if result.Nodes == nil {
+		result.Nodes = []graph.Entity{}
+	}
+	if result.Edges == nil {
+		result.Edges = []graph.Relation{}
+	}
 	s.observer.Count("graph_query_requests_total", 1, map[string]string{"operation": "query", "status": "succeeded"})
 	s.observer.Count("graph_query_result_nodes_total", int64(len(result.Nodes)), map[string]string{"operation": "query"})
+	s.observer.Count("graph_query_visited_total", int64(result.Diagnostics.Visited), map[string]string{"operation": "query"})
+	if result.Diagnostics.Truncated {
+		s.observer.Count("graph_query_truncated_total", 1, map[string]string{"operation": "query"})
+	}
 	return result, nil
 }
 
 func (s *QueryService) QueryDiagnostics(ctx context.Context, query graph.DiagnosticQuery) (result graph.DiagnosticResult, err error) {
+	ctx, finish := startGraphStage(s.observer, ctx, "graph_query", map[string]string{
+		"operation": "diagnostics", "tenant_id": query.Scope.TenantID, "repository_id": query.Scope.RepositoryID,
+		"snapshot_id": query.Scope.SnapshotID, "trace_id": query.Scope.TraceID,
+	})
+	defer func() { finish(err) }()
 	if validateErr := query.Validate(); validateErr != nil {
 		return graph.DiagnosticResult{}, queryError(graph.ErrInvalidInput, "validate_diagnostics", "request", false, "graph diagnostics query is invalid", validateErr)
 	}
@@ -102,8 +122,6 @@ func (s *QueryService) QueryDiagnostics(ctx context.Context, query graph.Diagnos
 	}
 	defer s.release()
 
-	finish := s.observer.Stage(ctx, "graph_query", map[string]string{"operation": "diagnostics"})
-	defer func() { finish(err) }()
 	queryCtx, cancel := context.WithTimeout(ctx, s.config.Timeout)
 	defer cancel()
 
@@ -111,29 +129,42 @@ func (s *QueryService) QueryDiagnostics(ctx context.Context, query graph.Diagnos
 	if err != nil {
 		return graph.DiagnosticResult{}, classifyQueryContext(queryCtx, err)
 	}
-	result, err = s.graph.QueryRevisionDiagnostics(queryCtx, revision.RevisionID, query)
+	dataCtx, finishData := startGraphStage(s.observer, queryCtx, "graph_neo4j_query", map[string]string{"operation": "diagnostics", "dependency": "neo4j", "revision_id": revision.RevisionID})
+	result, err = s.graph.QueryRevisionDiagnostics(dataCtx, revision.RevisionID, query)
+	finishData(err)
 	if err != nil {
 		return graph.DiagnosticResult{}, classifyQueryContext(queryCtx, activeQueryError("query_diagnostics", err))
 	}
 	if result.RevisionID != revision.RevisionID {
 		return graph.DiagnosticResult{}, inconsistentQueryResult("query_diagnostics", "neo4j", "neo4j returned diagnostics for an unexpected graph revision", nil)
 	}
+	if result.Issues == nil {
+		result.Issues = []graph.ResolutionIssue{}
+	}
 	s.observer.Count("graph_query_requests_total", 1, map[string]string{"operation": "diagnostics", "status": "succeeded"})
 	s.observer.Count("graph_query_diagnostic_issues_total", int64(len(result.Issues)), map[string]string{"operation": "diagnostics"})
+	if result.Truncated {
+		s.observer.Count("graph_query_truncated_total", 1, map[string]string{"operation": "diagnostics"})
+	}
 	return result, nil
 }
 
 func (s *QueryService) resolveAndVerify(ctx context.Context, scope common.Scope) (graph.Revision, error) {
-	revision, err := s.revisions.ActiveGraphRevision(ctx, scope)
+	controlCtx, finishControl := startGraphStage(s.observer, ctx, "graph_active_revision", map[string]string{"operation": "resolve", "dependency": "postgresql"})
+	revision, err := s.revisions.ActiveGraphRevision(controlCtx, scope)
+	finishControl(err)
 	if err != nil {
 		return graph.Revision{}, err
 	}
 	if err := validateActiveQueryRevision(scope, revision); err != nil {
 		return graph.Revision{}, err
 	}
-	if err := s.graph.VerifyRevision(ctx, revision); err != nil {
+	dataCtx, finishData := startGraphStage(s.observer, ctx, "graph_neo4j_verify", map[string]string{"operation": "verify", "dependency": "neo4j", "revision_id": revision.RevisionID})
+	if err := s.graph.VerifyRevision(dataCtx, revision); err != nil {
+		finishData(err)
 		return graph.Revision{}, activeQueryError("verify_revision", err)
 	}
+	finishData(nil)
 	return revision, nil
 }
 

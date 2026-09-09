@@ -93,3 +93,10 @@ type FallibleIDGenerator interface {
 	NewID(prefix string) (string, error)
 }
 type Clock interface{ Now() time.Time }
+
+// HealthChecker is the dependency contract used by Graph readiness. Startup
+// schema checks remain adapter-specific and execute before a role is marked
+// ready.
+type HealthChecker interface {
+	Health(context.Context) error
+}

@@ -79,7 +79,7 @@ func (s *Service) Build(ctx context.Context, cmd graph.BuildCommand) (revision g
 	if validateErr := cmd.Validate(); validateErr != nil {
 		return revision, domainError(graph.ErrInvalidInput, "validate", validateErr.Error(), false, validateErr)
 	}
-	finish := s.observer.Stage(ctx, "graph_build", labels(cmd.Scope))
+	ctx, finish := startGraphStage(s.observer, ctx, "graph_build", labels(cmd.Scope))
 	defer func() { finish(err) }()
 	input, err := s.source.GraphInput(ctx, cmd.Scope)
 	if err != nil {
@@ -128,8 +128,7 @@ func (s *Service) Build(ctx context.Context, cmd graph.BuildCommand) (revision g
 	revision.BuildStatus, revision.EntityMeta.Status, revision.UpdatedAt = graph.RevisionActive, string(graph.RevisionActive), s.clock.Now().UTC()
 	revision.Normalize()
 	revision.Quality = graph.QualityStats{InputArtifacts: int64(len(input.Artifacts)), WrittenArtifacts: int64(revision.Stats.Nodes - revision.Stats.UnresolvedTargets), InputRelations: int64(len(input.Relations)), WrittenRelations: int64(revision.Stats.Edges)}
-	revision.PublishedEvent = common.EventEnvelope{EventID: s.ids.New("evt"), EventType: "graph.published.v1", AggregateID: revision.RevisionID, OccurredAt: s.clock.Now().UTC(), Producer: "code-knowledge-graph", PayloadVersion: 1, TraceID: cmd.Scope.TraceID,
-		Payload: map[string]any{"tenant_id": cmd.Scope.TenantID, "repository_id": cmd.Scope.RepositoryID, "revision_id": revision.RevisionID, "snapshot_id": revision.SnapshotID, "commit_sha": revision.CommitSHA, "nodes": revision.Stats.Nodes, "edges": revision.Stats.Edges, "unresolved_targets": revision.Stats.UnresolvedTargets, "algorithm_version": revision.AlgorithmVersion, "graph_schema_version": revision.GraphSchemaVersion, "build_policy_version": revision.BuildPolicyVersion, "quality_status": revision.QualityStatus}}
+	revision.PublishedEvent = newPublishedEvent(revision, s.ids.New("evt"), s.clock.Now().UTC())
 	if err = s.repo.Save(ctx, cmd.IdempotencyKey, revision); err != nil {
 		return graph.Revision{}, domainError(graph.ErrPersistence, "publish_revision", "failed to atomically publish graph revision", true, err)
 	}
@@ -149,7 +148,7 @@ func (s *Service) Build(ctx context.Context, cmd graph.BuildCommand) (revision g
 }
 
 func (s *Service) Query(ctx context.Context, q graph.Query) (result graph.Result, err error) {
-	finish := s.observer.Stage(ctx, "graph_query", labels(q.Scope))
+	ctx, finish := startGraphStage(s.observer, ctx, "graph_query", labels(q.Scope))
 	defer func() { finish(err) }()
 	result, err = s.repo.Query(ctx, q)
 	if err != nil {
@@ -313,7 +312,7 @@ func cloneStrings(in map[string]string) map[string]string {
 	return out
 }
 func labels(s common.Scope) map[string]string {
-	return map[string]string{"tenant_id": s.TenantID, "repository_id": s.RepositoryID, "snapshot_id": s.SnapshotID, "trace_id": s.TraceID}
+	return map[string]string{"operation": "legacy", "tenant_id": s.TenantID, "repository_id": s.RepositoryID, "snapshot_id": s.SnapshotID, "trace_id": s.TraceID}
 }
 func domainError(code graph.ErrorCode, op, msg string, retry bool, cause error) *graph.DomainError {
 	return &graph.DomainError{Code: code, Operation: op, Stage: op, Message: msg, Retryable: retry, Cause: cause}
