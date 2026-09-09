@@ -96,7 +96,10 @@ type parseFailedPayload struct {
 
 func (c *Consumer) Handle(ctx context.Context, trustedScope common.Scope, event common.EventEnvelope) (result ConsumerResult, err error) {
 	result.Disposition = ConsumerRetry
-	finish := c.observer.Stage(ctx, "graph_consumer", map[string]string{"operation": "consume"})
+	ctx, finish := startGraphStage(c.observer, ctx, "graph_consumer", map[string]string{
+		"operation": "consume", "tenant_id": trustedScope.TenantID, "repository_id": trustedScope.RepositoryID,
+		"snapshot_id": trustedScope.SnapshotID, "trace_id": event.TraceID,
+	})
 	defer func() { finish(err) }()
 
 	encoded, encodeErr := json.Marshal(event)
@@ -148,8 +151,10 @@ func (c *Consumer) Handle(ctx context.Context, trustedScope common.Scope, event 
 		return result, workerError(graph.ErrBuildFailure, "consumer_identity", true, "graph consumer could not allocate job identities", nil)
 	}
 	storeCtx, cancelStore := context.WithTimeout(ctx, c.config.StoreTimeout)
+	storeCtx, finishEnqueue := startGraphStage(c.observer, storeCtx, "graph_control_enqueue", map[string]string{"operation": "enqueue", "dependency": "postgresql"})
 	stored, created, enqueueErr := c.admission.EnqueueGraphBuildWithinQuota(storeCtx, job, c.config.MaxPendingGlobal, c.config.MaxPendingPerTenant)
 	cancelStore()
+	finishEnqueue(enqueueErr)
 	if enqueueErr != nil {
 		if retryableError(enqueueErr) || errors.Is(enqueueErr, context.Canceled) || errors.Is(enqueueErr, context.DeadlineExceeded) {
 			c.observer.Count("graph_consumer_events_total", 1, map[string]string{"status": "retry"})
@@ -248,9 +253,12 @@ func (c *Consumer) reject(ctx context.Context, scope common.Scope, event common.
 	}
 	storeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.config.StoreTimeout)
 	defer cancel()
-	if _, err := c.rejected.RecordRejectedGraphEvent(storeCtx, rejected); err != nil {
+	storeCtx, finishReject := startGraphStage(c.observer, storeCtx, "graph_control_reject", map[string]string{"operation": "reject", "dependency": "postgresql"})
+	_, storeErr := c.rejected.RecordRejectedGraphEvent(storeCtx, rejected)
+	finishReject(storeErr)
+	if storeErr != nil {
 		c.observer.Count("graph_consumer_events_total", 1, map[string]string{"status": "retry"})
-		return ConsumerResult{Disposition: ConsumerRetry}, err
+		return ConsumerResult{Disposition: ConsumerRetry}, storeErr
 	}
 	c.observer.Count("graph_consumer_events_total", 1, map[string]string{"status": "rejected"})
 	return ConsumerResult{Disposition: ConsumerAck, Rejected: true}, nil

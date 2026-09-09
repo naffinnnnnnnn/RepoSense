@@ -62,10 +62,12 @@ paths:
         '404': { description: Wiki page not found for the requested snapshot }
   /v1/repositories/{repository_id}/snapshots/{snapshot_id}/graph:
     post:
-      summary: Build and atomically publish a versioned code knowledge graph
+      summary: Enqueue a complete code knowledge graph build
       parameters:
         - { in: path, name: repository_id, required: true, schema: { type: string } }
         - { in: path, name: snapshot_id, required: true, schema: { type: string } }
+        - { in: header, name: X-Tenant-ID, required: true, schema: { type: string, minLength: 1 } }
+        - { in: header, name: X-Trace-ID, required: true, schema: { type: string, minLength: 1 } }
         - { in: header, name: Idempotency-Key, required: true, schema: { type: string } }
       requestBody:
         required: true
@@ -73,21 +75,27 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/GraphBuildCommand' }
       responses:
-        '201':
-          description: Published immutable graph revision
+        '202':
+          description: Build durably accepted; construction runs asynchronously
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/GraphRevision' }
-        '400': { description: Invalid build command or graph input }
-        '404': { description: Snapshot or parent graph revision not found }
-        '409': { description: Idempotency or publication conflict }
+              schema: { $ref: '#/components/schemas/GraphBuildJob' }
+        '400': { description: Invalid command, unsupported mode, partial build, or tenant conflict, content: { application/json: { schema: { $ref: '#/components/schemas/GraphError' } } } }
+        '401': { description: Missing or invalid authenticated tenant scope, content: { application/json: { schema: { $ref: '#/components/schemas/GraphError' } } } }
+        '404': { description: Parser snapshot metadata not found, content: { application/json: { schema: { $ref: '#/components/schemas/GraphError' } } } }
+        '409': { description: Idempotency conflict, content: { application/json: { schema: { $ref: '#/components/schemas/GraphError' } } } }
+        '429': { description: Pending build quota exhausted, content: { application/json: { schema: { $ref: '#/components/schemas/GraphError' } } } }
+        '503': { description: Parser or PostgreSQL control plane unavailable, content: { application/json: { schema: { $ref: '#/components/schemas/GraphError' } } } }
     get:
-      summary: Query a graph revision pinned to a repository snapshot
+      summary: Query the exact ACTIVE graph revision for a repository snapshot
       parameters:
         - { in: path, name: repository_id, required: true, schema: { type: string } }
         - { in: path, name: snapshot_id, required: true, schema: { type: string } }
-        - { in: query, name: tenant_id, required: true, schema: { type: string } }
+        - { in: header, name: X-Tenant-ID, required: true, schema: { type: string, minLength: 1 } }
+        - { in: header, name: X-Trace-ID, required: true, schema: { type: string, minLength: 1 } }
         - { in: query, name: root_id, schema: { type: array, items: { type: string } } }
+        - { in: query, name: relation_type, schema: { type: array, items: { enum: [CONTAINS, IMPORTS, CALLS, EXTENDS, IMPLEMENTS, DEPENDS_ON] } } }
+        - { in: query, name: entity_type, schema: { type: array, items: { enum: [REPOSITORY, MODULE, FILE, CLASS, INTERFACE, FUNCTION, METHOD, IMPORT, CONFIG, DOCUMENT, PACKAGE, SYMBOL] } } }
         - { in: query, name: depth, schema: { type: integer, minimum: 0, maximum: 10, default: 1 } }
         - { in: query, name: direction, schema: { enum: [BOTH, OUTGOING, INCOMING], default: BOTH } }
         - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 10000, default: 500 } }
@@ -97,8 +105,34 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/GraphResult' }
-        '400': { description: Invalid query }
-        '404': { description: Graph revision or root not found }
+        '400': { description: Invalid query, content: { application/json: { schema: { $ref: '#/components/schemas/GraphError' } } } }
+        '401': { description: Missing or invalid authenticated tenant scope, content: { application/json: { schema: { $ref: '#/components/schemas/GraphError' } } } }
+        '404': { description: ACTIVE graph revision or root not found, content: { application/json: { schema: { $ref: '#/components/schemas/GraphError' } } } }
+        '429': { description: Query budget exhausted, content: { application/json: { schema: { $ref: '#/components/schemas/GraphError' } } } }
+        '503': { description: Control plane, graph store, or ACTIVE graph consistency unavailable, content: { application/json: { schema: { $ref: '#/components/schemas/GraphError' } } } }
+        '504': { description: Query execution timed out, content: { application/json: { schema: { $ref: '#/components/schemas/GraphError' } } } }
+  /v1/repositories/{repository_id}/snapshots/{snapshot_id}/graph/diagnostics:
+    get:
+      summary: Query resolution diagnostics for the exact ACTIVE graph revision
+      parameters:
+        - { in: path, name: repository_id, required: true, schema: { type: string } }
+        - { in: path, name: snapshot_id, required: true, schema: { type: string } }
+        - { in: header, name: X-Tenant-ID, required: true, schema: { type: string, minLength: 1 } }
+        - { in: header, name: X-Trace-ID, required: true, schema: { type: string, minLength: 1 } }
+        - { in: query, name: artifact_id, required: true, schema: { type: array, minItems: 1, items: { type: string, minLength: 1 } } }
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 10000, default: 100 } }
+      responses:
+        '200':
+          description: Bounded resolution issues for the requested Parser ArtifactIDs
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GraphDiagnosticResult' }
+        '400': { description: Invalid diagnostic query, content: { application/json: { schema: { $ref: '#/components/schemas/GraphError' } } } }
+        '401': { description: Missing or invalid authenticated tenant scope, content: { application/json: { schema: { $ref: '#/components/schemas/GraphError' } } } }
+        '404': { description: ACTIVE graph revision or diagnostic root not found, content: { application/json: { schema: { $ref: '#/components/schemas/GraphError' } } } }
+        '429': { description: Diagnostic query budget exhausted, content: { application/json: { schema: { $ref: '#/components/schemas/GraphError' } } } }
+        '503': { description: Control plane, graph store, or ACTIVE graph consistency unavailable, content: { application/json: { schema: { $ref: '#/components/schemas/GraphError' } } } }
+        '504': { description: Query execution timed out, content: { application/json: { schema: { $ref: '#/components/schemas/GraphError' } } } }
   /v1/repositories/{repository_id}/snapshots/{snapshot_id}/search:
     post:
       summary: Retrieve ranked code evidence from an exact repository snapshot
@@ -293,28 +327,84 @@ components:
         content_hash: { type: string, pattern: '^sha256:' }
     GraphBuildCommand:
       type: object
-      required: [tenant_id, mode]
+      additionalProperties: false
+      required: [mode]
+      properties:
+        tenant_id: { type: string, minLength: 1, deprecated: true, description: "Compatibility field only; when supplied it must equal the authenticated X-Tenant-ID." }
+        mode: { const: FULL }
+        artifact_ids: { type: array, maxItems: 0, description: Partial graph builds are not supported, items: { type: string, minLength: 1 } }
+    GraphScope:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, repository_id, snapshot_id, trace_id]
       properties:
         tenant_id: { type: string, minLength: 1 }
-        mode: { enum: [FULL, INCREMENTAL] }
-        artifact_ids: { type: array, uniqueItems: true, items: { type: string, minLength: 1 } }
+        repository_id: { type: string, minLength: 1 }
+        snapshot_id: { type: string, minLength: 1 }
+        trace_id: { type: string, minLength: 1 }
+    GraphBuildVersions:
+      type: object
+      additionalProperties: false
+      required: [parser_result_version, graph_schema_version, graph_algorithm_version, build_policy_version]
+      properties:
+        parser_result_version: { type: string, minLength: 1 }
+        graph_schema_version: { type: string, minLength: 1 }
+        graph_algorithm_version: { type: string, minLength: 1 }
+        build_policy_version: { type: string, minLength: 1 }
+    GraphBuildJob:
+      type: object
+      additionalProperties: false
+      required: [job_id, scope, idempotency_key, request_fingerprint, commit_sha, versions, status, event_id, created_at, updated_at]
+      properties:
+        job_id: { type: string, minLength: 1 }
+        scope: { $ref: '#/components/schemas/GraphScope' }
+        idempotency_key: { type: string, minLength: 1 }
+        trigger_event_id: { type: string, minLength: 1 }
+        request_fingerprint: { type: string, pattern: '^[0-9a-f]{64}$' }
+        commit_sha: { type: string, minLength: 1 }
+        versions: { $ref: '#/components/schemas/GraphBuildVersions' }
+        status: { enum: [PENDING, BUILDING, SUCCEEDED, FAILED, CANCELLED] }
+        revision_id: { type: string, minLength: 1 }
+        event_id: { type: string, minLength: 1 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
     GraphRevision:
       type: object
-      required: [revision_id, snapshot_id, commit_sha, build_status, algorithm_version, stats]
+      required: [revision_id, snapshot_id, commit_sha, build_mode, build_status, parser_result_version, graph_schema_version, algorithm_version, build_policy_version, quality_status, request_fingerprint, stats, quality]
       properties:
-        revision_id: { type: string }
-        snapshot_id: { type: string }
-        parent_revision_id: { type: string }
-        commit_sha: { type: string }
+        revision_id: { type: string, minLength: 1 }
+        snapshot_id: { type: string, minLength: 1 }
+        commit_sha: { type: string, minLength: 1 }
+        build_mode: { const: FULL }
         build_status: { enum: [ACTIVE] }
-        algorithm_version: { type: string }
+        parser_result_version: { type: string, minLength: 1 }
+        graph_schema_version: { type: string, minLength: 1 }
+        algorithm_version: { type: string, minLength: 1 }
+        build_policy_version: { type: string, minLength: 1 }
+        quality_status: { enum: [HEALTHY, DEGRADED] }
+        request_fingerprint: { type: string, pattern: '^[0-9a-f]{64}$' }
         stats:
           type: object
+          additionalProperties: false
+          required: [nodes, edges, unresolved_targets, ambiguous_relations]
           properties:
             nodes: { type: integer, minimum: 0 }
             edges: { type: integer, minimum: 0 }
             unresolved_targets: { type: integer, minimum: 0 }
             ambiguous_relations: { type: integer, minimum: 0 }
+        quality:
+          type: object
+          required: [input_artifacts, written_artifacts, invalid_artifacts, input_relations, written_relations, invalid_relations]
+          properties:
+            input_artifacts: { type: integer, minimum: 0 }
+            written_artifacts: { type: integer, minimum: 0 }
+            invalid_artifacts: { type: integer, minimum: 0 }
+            input_relations: { type: integer, minimum: 0 }
+            written_relations: { type: integer, minimum: 0 }
+            invalid_relations: { type: integer, minimum: 0 }
+            resolution_counts: { type: object, additionalProperties: { type: integer, minimum: 0 } }
+            error_counts: { type: object, additionalProperties: { type: integer, minimum: 0 } }
+            error_samples: { type: array, items: { type: object } }
     SourceRef:
       type: object
       required: [commit_sha, path, start_line, end_line, content_hash]
@@ -350,6 +440,7 @@ components:
         confidence: { type: number, minimum: 0, maximum: 1 }
     GraphResult:
       type: object
+      additionalProperties: false
       required: [nodes, edges, diagnostics]
       properties:
         nodes: { type: array, items: { $ref: '#/components/schemas/GraphNode' } }
@@ -362,6 +453,42 @@ components:
             visited: { type: integer, minimum: 0 }
             truncated: { type: boolean }
             duration_ms: { type: integer, minimum: 0 }
+    GraphResolutionIssue:
+      type: object
+      additionalProperties: false
+      required: [issue_id, relation_id, source_artifact_id, intended_kind, resolution_status, raw_target_symbol, reason_code, confidence, evidence]
+      properties:
+        issue_id: { type: string, minLength: 1 }
+        relation_id: { type: string, minLength: 1 }
+        source_artifact_id: { type: string, minLength: 1 }
+        intended_kind: { enum: [CONTAINS, IMPORTS, CALLS, EXTENDS, IMPLEMENTS, DEPENDS_ON] }
+        resolution_status: { enum: [AMBIGUOUS, UNRESOLVED] }
+        raw_target_symbol: { type: string, minLength: 1 }
+        reason_code: { type: string, minLength: 1 }
+        confidence: { type: number, minimum: 0, maximum: 1 }
+        evidence: { $ref: '#/components/schemas/SourceRef' }
+        candidate_artifact_ids: { type: array, uniqueItems: true, items: { type: string, minLength: 1 } }
+    GraphDiagnosticResult:
+      type: object
+      additionalProperties: false
+      required: [revision_id, issues, truncated]
+      properties:
+        revision_id: { type: string, minLength: 1 }
+        issues: { type: array, items: { $ref: '#/components/schemas/GraphResolutionIssue' } }
+        truncated: { type: boolean }
+    GraphError:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, retryable]
+          properties:
+            code: { type: string, minLength: 1 }
+            message: { type: string, minLength: 1 }
+            retryable: { type: boolean }
     VisualizationQuery:
       type: object
       additionalProperties: false

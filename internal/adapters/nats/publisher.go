@@ -38,6 +38,12 @@ func (p *Publisher) Close() {
 		p.connection.Close()
 	}
 }
+func (p *Publisher) Health(ctx context.Context) error {
+	if p == nil || p.connection == nil {
+		return errors.New("NATS connection is not configured")
+	}
+	return p.connection.FlushWithContext(ctx)
+}
 func (p *Publisher) Publish(ctx context.Context, event common.EventEnvelope) error {
 	if p == nil || p.jetstream == nil {
 		return errors.New("NATS JetStream 未配置")
@@ -50,6 +56,7 @@ func (p *Publisher) Publish(ctx context.Context, event common.EventEnvelope) err
 		return err
 	}
 	message := &gonats.Msg{Subject: event.EventType, Data: payload, Header: gonats.Header{}}
+	injectTraceContext(ctx, message.Header)
 	if scope, ok := repository.EventScopeFromContext(ctx); ok {
 		message.Header.Set("RepoSense-Tenant-ID", scope.TenantID)
 		message.Header.Set("RepoSense-Repository-ID", scope.RepositoryID)

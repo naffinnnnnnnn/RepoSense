@@ -44,8 +44,15 @@ func (c GraphDataConfig) Validate() error {
 }
 
 func NewGraphDataStore(ctx context.Context, uri, username, password, database string) (*GraphDataStore, error) {
+	return NewGraphDataStoreConfigured(ctx, uri, username, password, database, DefaultGraphDataConfig())
+}
+
+func NewGraphDataStoreConfigured(ctx context.Context, uri, username, password, database string, config GraphDataConfig) (*GraphDataStore, error) {
 	if strings.TrimSpace(uri) == "" || strings.TrimSpace(username) == "" || password == "" {
 		return nil, fmt.Errorf("neo4j uri, username and password are required")
+	}
+	if err := config.Validate(); err != nil {
+		return nil, err
 	}
 	driver, err := neo4jdriver.NewDriverWithContext(uri, neo4jdriver.BasicAuth(username, password, ""))
 	if err != nil {
@@ -55,7 +62,7 @@ func NewGraphDataStore(ctx context.Context, uri, username, password, database st
 		_ = driver.Close(ctx)
 		return nil, graphStoreError("verify_connectivity", "connect", err)
 	}
-	return &GraphDataStore{driver: driver, database: database, config: DefaultGraphDataConfig()}, nil
+	return &GraphDataStore{driver: driver, database: database, config: config}, nil
 }
 
 func NewGraphDataStoreWithDriver(driver neo4jdriver.Driver, database string) *GraphDataStore {

@@ -62,7 +62,7 @@ func NewGraphOutboxDispatcher(store ports.GraphOutboxStore, publisher ports.Even
 
 func (d *GraphOutboxDispatcher) DispatchOnce(ctx context.Context) (published int, err error) {
 	now := d.clock.Now().UTC()
-	finish := d.observer.Stage(ctx, "graph_outbox", map[string]string{"operation": "dispatch"})
+	ctx, finish := startGraphStage(d.observer, ctx, "graph_outbox", map[string]string{"operation": "dispatch"})
 	defer func() { finish(err) }()
 	claimCtx, cancelClaim := context.WithTimeout(ctx, d.config.StoreTimeout)
 	records, err := d.store.ClaimGraphEvents(claimCtx, d.config.BatchSize, now, now.Add(d.config.ClaimDuration))
@@ -72,26 +72,27 @@ func (d *GraphOutboxDispatcher) DispatchOnce(ctx context.Context) (published int
 		return 0, err
 	}
 	d.observer.Count("graph_outbox_claimed_total", int64(len(records)), nil)
-	if len(records) > 0 {
-		age := now.Sub(records[0].CreatedAt)
-		if age < 0 {
-			age = 0
-		}
-		d.observer.Count("graph_outbox_oldest_age_seconds", int64(age.Seconds()), nil)
-	}
 	var failures []error
 	for _, record := range records {
 		if contextErr := ctx.Err(); contextErr != nil {
 			failures = append(failures, contextErr)
 			break
 		}
-		publishCtx, cancelPublish := context.WithTimeout(repository.WithEventScope(ctx, record.Scope), d.config.PublishTimeout)
+		messageCtx, finishPublish := startGraphStage(d.observer, repository.WithEventScope(ctx, record.Scope), "graph_outbox_publish", map[string]string{
+			"operation": "publish", "dependency": "nats", "tenant_id": record.Scope.TenantID,
+			"repository_id": record.Scope.RepositoryID, "snapshot_id": record.Scope.SnapshotID,
+			"revision_id": record.RevisionID, "trace_id": record.Scope.TraceID, "trace_root": "true",
+		})
+		publishCtx, cancelPublish := context.WithTimeout(messageCtx, d.config.PublishTimeout)
 		publishErr := d.publisher.Publish(publishCtx, record.Event)
 		cancelPublish()
+		finishPublish(publishErr)
 		if publishErr == nil {
 			storeCtx, cancelStore := context.WithTimeout(context.WithoutCancel(ctx), d.config.StoreTimeout)
+			storeCtx, finishStore := startGraphStage(d.observer, storeCtx, "graph_outbox_mark", map[string]string{"operation": "published", "dependency": "postgresql"})
 			markErr := d.store.MarkGraphEventPublished(storeCtx, record.Event.EventID, d.clock.Now().UTC())
 			cancelStore()
+			finishStore(markErr)
 			if markErr != nil {
 				failures = append(failures, markErr)
 				d.observer.Count("graph_outbox_operations_total", 1, map[string]string{"status": "mark_unknown"})
@@ -115,8 +116,10 @@ func (d *GraphOutboxDispatcher) DispatchOnce(ctx context.Context) (published int
 			nextAttempt = failedAt
 		}
 		storeCtx, cancelStore := context.WithTimeout(context.WithoutCancel(ctx), d.config.StoreTimeout)
+		storeCtx, finishStore := startGraphStage(d.observer, storeCtx, "graph_outbox_mark", map[string]string{"operation": "failed", "dependency": "postgresql"})
 		markErr := d.store.MarkGraphEventFailed(storeCtx, record.Event.EventID, "graph event publication failed", nextAttempt, deadLetter)
 		cancelStore()
+		finishStore(markErr)
 		status := "retry_scheduled"
 		if deadLetter {
 			status = "dead_lettered"

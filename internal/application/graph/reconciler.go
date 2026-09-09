@@ -67,7 +67,7 @@ func (r *Reconciler) RunOnce(ctx context.Context) (report ReconciliationReport, 
 	runCtx, cancelRun := context.WithTimeout(ctx, r.config.OperationTimeout)
 	defer cancelRun()
 	ctx = runCtx
-	finish := r.observer.Stage(ctx, "graph_reconciler", map[string]string{"operation": "reconcile"})
+	ctx, finish := startGraphStage(r.observer, ctx, "graph_reconciler", map[string]string{"operation": "reconcile"})
 	defer func() { finish(err) }()
 	now := r.clock.Now().UTC()
 	var failures []error
@@ -76,15 +76,19 @@ func (r *Reconciler) RunOnce(ctx context.Context) (report ReconciliationReport, 
 	if listErr != nil {
 		failures = append(failures, listErr)
 	} else {
+		r.observer.Count("graph_reconciler_expired_attempts_detected_total", int64(len(expired)), nil)
 		for _, attempt := range expired {
 			if ctx.Err() != nil {
 				failures = append(failures, ctx.Err())
 				break
 			}
 			startedAt := r.clock.Now().UTC()
+			actionCtx, finishAction := startGraphStage(r.observer, ctx, "graph_reconciler_action", map[string]string{
+				"operation": "repair", "action": "expire_attempt", "attempt_id": attempt.AttemptID, "revision_id": attempt.RevisionID,
+			})
 			result := "LOST_REBUILD_PENDING"
-			if job, jobErr := r.buildStore.GraphJob(ctx, attempt.JobID); jobErr == nil {
-				if status, statusErr := r.dataStore.CandidateStatus(ctx, job.Scope, attempt.RevisionID); statusErr == nil && status == graph.CandidateSealed {
+			if job, jobErr := r.buildStore.GraphJob(actionCtx, attempt.JobID); jobErr == nil {
+				if status, statusErr := r.dataStore.CandidateStatus(actionCtx, job.Scope, attempt.RevisionID); statusErr == nil && status == graph.CandidateSealed {
 					result = "SEALED_REBUILD_PENDING"
 				} else if statusErr != nil {
 					result = "LOST_CANDIDATE_STATUS_UNKNOWN"
@@ -92,7 +96,7 @@ func (r *Reconciler) RunOnce(ctx context.Context) (report ReconciliationReport, 
 			} else {
 				result = "LOST_JOB_STATE_UNKNOWN"
 			}
-			actionErr := r.store.MarkGraphAttemptLost(ctx, attempt.JobID, attempt.AttemptID, attempt.Fence, now)
+			actionErr := r.store.MarkGraphAttemptLost(actionCtx, attempt.JobID, attempt.AttemptID, attempt.Fence, now)
 			if actionErr == nil {
 				report.ExpiredAttempts++
 				r.observer.Count("graph_reconciler_actions_total", 1, map[string]string{"action": "expire_attempt", "status": "repaired"})
@@ -103,7 +107,9 @@ func (r *Reconciler) RunOnce(ctx context.Context) (report ReconciliationReport, 
 				result = "FAILED"
 				failures = append(failures, actionErr)
 			}
-			if auditErr := r.recordRun(ctx, "expire_attempt", "attempt", attempt.AttemptID, result, startedAt, actionErr); auditErr != nil {
+			auditErr := r.recordRun(actionCtx, "expire_attempt", "attempt", attempt.AttemptID, result, startedAt, actionErr)
+			finishAction(errors.Join(actionErr, auditErr))
+			if auditErr != nil {
 				failures = append(failures, auditErr)
 			}
 		}
@@ -114,13 +120,17 @@ func (r *Reconciler) RunOnce(ctx context.Context) (report ReconciliationReport, 
 	if listErr != nil {
 		failures = append(failures, listErr)
 	} else {
+		r.observer.Count("graph_reconciler_orphans_detected_total", int64(len(orphans)), nil)
 		for _, attempt := range orphans {
 			if ctx.Err() != nil {
 				failures = append(failures, ctx.Err())
 				break
 			}
 			startedAt := r.clock.Now().UTC()
-			result, actionErr := r.deleteOrphan(ctx, attempt)
+			actionCtx, finishAction := startGraphStage(r.observer, ctx, "graph_reconciler_action", map[string]string{
+				"operation": "repair", "action": "delete_orphan", "attempt_id": attempt.AttemptID, "revision_id": attempt.RevisionID,
+			})
+			result, actionErr := r.deleteOrphan(actionCtx, attempt)
 			if actionErr == nil {
 				report.DeletedOrphans++
 				r.observer.Count("graph_reconciler_actions_total", 1, map[string]string{"action": "delete_orphan", "status": "repaired"})
@@ -128,7 +138,9 @@ func (r *Reconciler) RunOnce(ctx context.Context) (report ReconciliationReport, 
 				failures = append(failures, actionErr)
 				r.observer.Count("graph_reconciler_actions_total", 1, map[string]string{"action": "delete_orphan", "status": "failed"})
 			}
-			if auditErr := r.recordRun(ctx, "delete_orphan", "revision", attempt.RevisionID, result, startedAt, actionErr); auditErr != nil {
+			auditErr := r.recordRun(actionCtx, "delete_orphan", "revision", attempt.RevisionID, result, startedAt, actionErr)
+			finishAction(errors.Join(actionErr, auditErr))
+			if auditErr != nil {
 				failures = append(failures, auditErr)
 			}
 		}
@@ -140,10 +152,14 @@ func (r *Reconciler) RunOnce(ctx context.Context) (report ReconciliationReport, 
 	} else {
 		for _, ref := range refs {
 			startedAt := r.clock.Now().UTC()
+			actionCtx, finishAction := startGraphStage(r.observer, ctx, "graph_reconciler_action", map[string]string{
+				"operation": "verify", "action": "verify_active", "tenant_id": ref.Scope.TenantID,
+				"repository_id": ref.Scope.RepositoryID, "snapshot_id": ref.Scope.SnapshotID, "revision_id": ref.RevisionID,
+			})
 			result := "VERIFIED"
 			verified := false
 			var actionErr error
-			revision, revisionErr := r.buildStore.ActiveGraphRevision(ctx, ref.Scope)
+			revision, revisionErr := r.buildStore.ActiveGraphRevision(actionCtx, ref.Scope)
 			switch {
 			case revisionErr != nil:
 				actionErr = revisionErr
@@ -152,7 +168,7 @@ func (r *Reconciler) RunOnce(ctx context.Context) (report ReconciliationReport, 
 				// replacement will be checked on a subsequent pass.
 				result = "SKIPPED_POINTER_CHANGED"
 			case revision.RevisionID == ref.RevisionID:
-				actionErr = r.dataStore.VerifyRevision(ctx, revision)
+				actionErr = r.dataStore.VerifyRevision(actionCtx, revision)
 				verified = actionErr == nil
 			}
 			if hasGraphErrorCode(actionErr, graph.ErrRevisionNotFound) {
@@ -173,7 +189,9 @@ func (r *Reconciler) RunOnce(ctx context.Context) (report ReconciliationReport, 
 				failures = append(failures, actionErr)
 				r.observer.Count("graph_reconciler_actions_total", 1, map[string]string{"action": "verify_active", "status": "failed"})
 			}
-			if auditErr := r.recordRun(ctx, "verify_active", "revision", ref.RevisionID, result, startedAt, actionErr); auditErr != nil {
+			auditErr := r.recordRun(actionCtx, "verify_active", "revision", ref.RevisionID, result, startedAt, actionErr)
+			finishAction(errors.Join(actionErr, auditErr))
+			if auditErr != nil {
 				failures = append(failures, auditErr)
 			}
 		}

@@ -23,6 +23,7 @@ type workerPageConsumer struct {
 }
 
 func (c *workerPageConsumer) ConsumeArtifactPage(ctx context.Context, _ graph.SnapshotMetadata, artifacts []repository.CodeArtifact) error {
+	c.worker.observer.Count("graph_parser_pages_total", 1, map[string]string{"stage": "artifacts"})
 	c.quality.InputArtifacts += int64(len(artifacts))
 	valid := make([]repository.CodeArtifact, 0, len(artifacts))
 	sizes := make([]int, 0, len(artifacts))
@@ -54,18 +55,23 @@ func (c *workerPageConsumer) ConsumeArtifactPage(ctx context.Context, _ graph.Sn
 			return err
 		}
 		batch := valid[start:end]
-		if err := c.worker.retryBatch(ctx, func() error {
-			return c.worker.dataStore.WriteArtifactBatch(ctx, c.job, c.attempt, batch)
-		}); err != nil {
-			return err
+		batchCtx, finishBatch := startGraphStage(c.worker.observer, ctx, "graph_neo4j_batch", map[string]string{"operation": "write", "stage": "artifacts", "dependency": "neo4j", "revision_id": c.attempt.RevisionID})
+		batchErr := c.worker.retryBatch(batchCtx, "artifacts", "neo4j", func() error {
+			return c.worker.dataStore.WriteArtifactBatch(batchCtx, c.job, c.attempt, batch)
+		})
+		finishBatch(batchErr)
+		if batchErr != nil {
+			return batchErr
 		}
 		c.quality.WrittenArtifacts += int64(len(batch))
+		c.worker.observer.Count("graph_worker_batch_records_total", int64(len(batch)), map[string]string{"stage": "artifacts"})
 		start = end
 	}
 	return nil
 }
 
 func (c *workerPageConsumer) ConsumeRelationPage(ctx context.Context, _ graph.SnapshotMetadata, relations []graph.ResolvedRelation) error {
+	c.worker.observer.Count("graph_parser_pages_total", 1, map[string]string{"stage": "relations"})
 	c.quality.InputRelations += int64(len(relations))
 	valid := make([]graph.ResolvedRelation, 0, len(relations))
 	sizes := make([]int, 0, len(relations))
@@ -97,12 +103,16 @@ func (c *workerPageConsumer) ConsumeRelationPage(ctx context.Context, _ graph.Sn
 			return err
 		}
 		batch := valid[start:end]
-		if err := c.worker.retryBatch(ctx, func() error {
-			return c.worker.dataStore.WriteRelationBatch(ctx, c.job, c.attempt, batch)
-		}); err != nil {
-			return err
+		batchCtx, finishBatch := startGraphStage(c.worker.observer, ctx, "graph_neo4j_batch", map[string]string{"operation": "write", "stage": "relations", "dependency": "neo4j", "revision_id": c.attempt.RevisionID})
+		batchErr := c.worker.retryBatch(batchCtx, "relations", "neo4j", func() error {
+			return c.worker.dataStore.WriteRelationBatch(batchCtx, c.job, c.attempt, batch)
+		})
+		finishBatch(batchErr)
+		if batchErr != nil {
+			return batchErr
 		}
 		c.quality.WrittenRelations += int64(len(batch))
+		c.worker.observer.Count("graph_worker_batch_records_total", int64(len(batch)), map[string]string{"stage": "relations"})
 		start = end
 	}
 	return nil

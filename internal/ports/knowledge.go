@@ -38,6 +38,13 @@ type GraphBuildStore interface {
 	ActiveGraphRevision(context.Context, common.Scope) (graph.Revision, error)
 }
 
+// GraphBuildConcurrencyStore is the production claim extension used to
+// enforce deployment-wide build limits in the PostgreSQL control plane. The
+// base claim method remains available for deterministic test stores.
+type GraphBuildConcurrencyStore interface {
+	ClaimGraphBuildWithinLimits(context.Context, string, string, string, time.Time, time.Duration, int, int, int) (graph.BuildJob, graph.BuildAttempt, bool, error)
+}
+
 type GraphBuildAdmissionStore interface {
 	EnqueueGraphBuildWithinQuota(context.Context, graph.BuildJob, int, int) (graph.BuildJob, bool, error)
 }

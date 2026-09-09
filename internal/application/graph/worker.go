@@ -14,25 +14,28 @@ import (
 )
 
 type WorkerConfig struct {
-	LeaseDuration       time.Duration
-	HeartbeatInterval   time.Duration
-	BuildTimeout        time.Duration
-	ControlTimeout      time.Duration
-	BatchSize           int
-	MaxArtifacts        int64
-	MaxRelations        int64
-	MaxArtifactBytes    int
-	MaxRelationBytes    int
-	MaxProperties       int
-	MaxCandidates       int
-	MaxErrorSamples     int
-	MaxBatchBytes       int
-	MaxRevisionBytes    int64
-	SourceAttempts      int
-	BatchAttempts       int
-	RetryInitialBackoff time.Duration
-	RetryMaxBackoff     time.Duration
-	QualityPolicy       graph.QualityPolicy
+	LeaseDuration           time.Duration
+	HeartbeatInterval       time.Duration
+	BuildTimeout            time.Duration
+	ControlTimeout          time.Duration
+	BatchSize               int
+	MaxArtifacts            int64
+	MaxRelations            int64
+	MaxArtifactBytes        int
+	MaxRelationBytes        int
+	MaxProperties           int
+	MaxCandidates           int
+	MaxErrorSamples         int
+	MaxBatchBytes           int
+	MaxRevisionBytes        int64
+	SourceAttempts          int
+	BatchAttempts           int
+	RetryInitialBackoff     time.Duration
+	RetryMaxBackoff         time.Duration
+	MaxConcurrentGlobal     int
+	MaxConcurrentTenant     int
+	MaxConcurrentRepository int
+	QualityPolicy           graph.QualityPolicy
 }
 
 func DefaultWorkerConfig() WorkerConfig {
@@ -45,6 +48,7 @@ func DefaultWorkerConfig() WorkerConfig {
 		MaxRevisionBytes: 4 * 1024 * 1024 * 1024,
 		SourceAttempts:   3, BatchAttempts: 3,
 		RetryInitialBackoff: 100 * time.Millisecond, RetryMaxBackoff: 2 * time.Second,
+		MaxConcurrentGlobal: 4, MaxConcurrentTenant: 2, MaxConcurrentRepository: 1,
 		QualityPolicy: graph.QualityPolicy{
 			MaxInvalidArtifacts: 100, MaxInvalidArtifactRatio: 0.001,
 			MaxInvalidRelations: 500, MaxInvalidRelationRatio: 0.001,
@@ -70,6 +74,9 @@ func (c WorkerConfig) Validate() error {
 	}
 	if c.RetryInitialBackoff <= 0 || c.RetryMaxBackoff < c.RetryInitialBackoff {
 		return fmt.Errorf("valid retry backoff bounds are required")
+	}
+	if c.MaxConcurrentGlobal <= 0 || c.MaxConcurrentGlobal > 10_000 || c.MaxConcurrentTenant <= 0 || c.MaxConcurrentTenant > c.MaxConcurrentGlobal || c.MaxConcurrentRepository != 1 {
+		return fmt.Errorf("build concurrency must be in range, tenant must not exceed global, and repository must equal one")
 	}
 	return c.QualityPolicy.Validate()
 }
@@ -106,27 +113,54 @@ func NewWorker(reader *SourceReader, buildStore ports.GraphBuildStore, dataStore
 	}, nil
 }
 
-// RunOnce claims and processes at most one graph build. Runtime polling and
-// deployment lifecycle belong to the graph-worker role implemented later.
+// RunOnce claims and processes at most one graph build. The graph-worker role
+// calls Run to execute bounded concurrent polling loops around this unit.
 func (w *Worker) RunOnce(ctx context.Context, owner string) (processed bool, err error) {
+	ctx, finish := startGraphStage(w.observer, ctx, "graph_worker", map[string]string{"operation": "build"})
+	defer func() { finish(err) }()
 	if strings.TrimSpace(owner) == "" || owner != strings.TrimSpace(owner) {
 		return false, workerError(graph.ErrInvalidInput, "claim", false, "worker owner must be an exact non-empty identity", nil)
 	}
-	finish := w.observer.Stage(ctx, "graph_worker", map[string]string{"operation": "build"})
-	defer func() { finish(err) }()
 
 	now := w.clock.Now().UTC()
 	attemptID, revisionID := w.ids.New("gat"), w.ids.New("gr")
 	if strings.TrimSpace(attemptID) == "" || strings.TrimSpace(revisionID) == "" {
 		return false, workerError(graph.ErrBuildFailure, "claim", false, "graph worker could not allocate build identities", nil)
 	}
-	job, attempt, claimed, err := w.buildStore.ClaimGraphBuild(ctx, owner, attemptID, revisionID, now, w.config.LeaseDuration)
+	var job graph.BuildJob
+	var attempt graph.BuildAttempt
+	var claimed bool
+	claimCtx, finishClaim := startGraphStage(w.observer, ctx, "graph_worker_claim", map[string]string{"operation": "claim", "dependency": "postgresql"})
+	if limited, ok := w.buildStore.(ports.GraphBuildConcurrencyStore); ok {
+		job, attempt, claimed, err = limited.ClaimGraphBuildWithinLimits(claimCtx, owner, attemptID, revisionID, now, w.config.LeaseDuration,
+			w.config.MaxConcurrentGlobal, w.config.MaxConcurrentTenant, w.config.MaxConcurrentRepository)
+	} else {
+		job, attempt, claimed, err = w.buildStore.ClaimGraphBuild(claimCtx, owner, attemptID, revisionID, now, w.config.LeaseDuration)
+	}
+	finishClaim(err)
 	if err != nil || !claimed {
+		status := "empty"
+		if err != nil {
+			status = "failed"
+		}
+		w.observer.Count("graph_worker_claims_total", 1, map[string]string{"status": status})
 		return false, err
 	}
 	if err := validateClaim(job, attempt, owner, attemptID, revisionID, now); err != nil {
 		return true, err
 	}
+	ctx, attemptFinish := startGraphStage(w.observer, ctx, "graph_worker_attempt", map[string]string{
+		"operation": "build", "tenant_id": job.Scope.TenantID, "repository_id": job.Scope.RepositoryID,
+		"snapshot_id": job.Scope.SnapshotID, "job_id": job.JobID, "attempt_id": attempt.AttemptID,
+		"revision_id": attempt.RevisionID, "trace_id": job.Scope.TraceID, "trace_root": "true",
+	})
+	defer func() { attemptFinish(err) }()
+	buildReason := "initial"
+	if attempt.Fence > 1 {
+		buildReason = "retry_or_takeover"
+	}
+	w.observer.Count("graph_worker_claims_total", 1, map[string]string{"status": "claimed", "build_reason": buildReason})
+	w.observer.Count("graph_worker_attempts_total", 1, map[string]string{"status": "started", "build_reason": buildReason})
 
 	timeoutCtx, timeoutCancel := context.WithTimeout(ctx, w.config.BuildTimeout)
 	defer timeoutCancel()
@@ -177,7 +211,9 @@ func validateClaim(job graph.BuildJob, attempt graph.BuildAttempt, owner, attemp
 }
 
 func (w *Worker) execute(ctx context.Context, guard *leaseGuard, job graph.BuildJob, attempt graph.BuildAttempt) error {
-	metadata, err := w.reader.Metadata(ctx, job.Scope)
+	metadataCtx, finishMetadata := startGraphStage(w.observer, ctx, "graph_parser_metadata", map[string]string{"operation": "read", "dependency": "parser"})
+	metadata, err := w.reader.Metadata(metadataCtx, job.Scope)
+	finishMetadata(err)
 	if err != nil {
 		return err
 	}
@@ -190,14 +226,19 @@ func (w *Worker) execute(ctx context.Context, guard *leaseGuard, job graph.Build
 	if err := guard.renew(ctx); err != nil {
 		return err
 	}
-	if err := w.retryBatch(ctx, func() error { return w.dataStore.CreateCandidate(ctx, job, attempt) }); err != nil {
+	candidateCtx, finishCandidate := startGraphStage(w.observer, ctx, "graph_neo4j_candidate", map[string]string{"operation": "create", "dependency": "neo4j", "revision_id": attempt.RevisionID})
+	err = w.retryBatch(candidateCtx, "candidate", "neo4j", func() error { return w.dataStore.CreateCandidate(candidateCtx, job, attempt) })
+	finishCandidate(err)
+	if err != nil {
 		return err
 	}
 
 	consumer := &workerPageConsumer{worker: w, guard: guard, job: job, attempt: attempt, metadata: metadata,
 		quality:            graph.QualityStats{ResolutionCounts: map[string]int64{}, ErrorCounts: map[string]int64{}},
 		invalidArtifactIDs: map[string]struct{}{}}
-	artifactCount, err := w.reader.readArtifacts(ctx, metadata, consumer)
+	artifactCtx, finishArtifacts := startGraphStage(w.observer, ctx, "graph_parser_pages", map[string]string{"operation": "read", "stage": "artifacts", "dependency": "parser"})
+	artifactCount, err := w.reader.readArtifacts(artifactCtx, metadata, consumer)
+	finishArtifacts(err)
 	if err != nil {
 		return err
 	}
@@ -207,13 +248,18 @@ func (w *Worker) execute(ctx context.Context, guard *leaseGuard, job graph.Build
 	if err := guard.renew(ctx); err != nil {
 		return err
 	}
-	if err := w.retryBatch(ctx, func() error {
-		return w.dataStore.CompleteArtifactStage(ctx, job, attempt, int(consumer.quality.WrittenArtifacts))
-	}); err != nil {
+	completeCtx, finishComplete := startGraphStage(w.observer, ctx, "graph_neo4j_artifact_stage", map[string]string{"operation": "complete", "dependency": "neo4j", "revision_id": attempt.RevisionID})
+	err = w.retryBatch(completeCtx, "artifact_stage", "neo4j", func() error {
+		return w.dataStore.CompleteArtifactStage(completeCtx, job, attempt, int(consumer.quality.WrittenArtifacts))
+	})
+	finishComplete(err)
+	if err != nil {
 		return err
 	}
 
-	relationCount, err := w.reader.readRelations(ctx, metadata, consumer)
+	relationCtx, finishRelations := startGraphStage(w.observer, ctx, "graph_parser_pages", map[string]string{"operation": "read", "stage": "relations", "dependency": "parser"})
+	relationCount, err := w.reader.readRelations(relationCtx, metadata, consumer)
+	finishRelations(err)
 	if err != nil {
 		return err
 	}
@@ -232,7 +278,10 @@ func (w *Worker) execute(ctx context.Context, guard *leaseGuard, job graph.Build
 	if err := guard.renew(ctx); err != nil {
 		return err
 	}
-	if err := w.sealCandidate(ctx, job, attempt, stats, qualityStatus); err != nil {
+	sealCtx, finishSeal := startGraphStage(w.observer, ctx, "graph_neo4j_seal", map[string]string{"operation": "seal", "dependency": "neo4j", "revision_id": attempt.RevisionID})
+	err = w.sealCandidate(sealCtx, job, attempt, stats, qualityStatus)
+	finishSeal(err)
+	if err != nil {
 		return err
 	}
 	if err := guard.renew(ctx); err != nil {
@@ -240,9 +289,21 @@ func (w *Worker) execute(ctx context.Context, guard *leaseGuard, job graph.Build
 	}
 	now := w.clock.Now().UTC()
 	revision, event := completedRevision(job, attempt, stats, consumer.quality, qualityStatus, now)
-	return w.retryBatch(ctx, func() error {
-		return w.buildStore.ActivateGraphRevision(ctx, job, attempt, revision, event, now)
+	activateCtx, finishActivate := startGraphStage(w.observer, ctx, "graph_control_activate", map[string]string{"operation": "activate", "dependency": "postgresql", "revision_id": attempt.RevisionID})
+	err = w.retryBatch(activateCtx, "activate", "postgresql", func() error {
+		return w.buildStore.ActivateGraphRevision(activateCtx, job, attempt, revision, event, now)
 	})
+	finishActivate(err)
+	if err == nil {
+		w.observer.Count("graph_worker_nodes_total", int64(stats.Nodes), map[string]string{"quality_status": string(qualityStatus)})
+		w.observer.Count("graph_worker_edges_total", int64(stats.Edges), map[string]string{"quality_status": string(qualityStatus)})
+		w.observer.Count("graph_worker_invalid_artifacts_total", consumer.quality.InvalidArtifacts, map[string]string{"quality_status": string(qualityStatus)})
+		w.observer.Count("graph_worker_invalid_relations_total", consumer.quality.InvalidRelations, map[string]string{"quality_status": string(qualityStatus)})
+		for errorCode, count := range consumer.quality.ErrorCounts {
+			w.observer.Count("graph_worker_quality_errors_total", count, map[string]string{"error_code": errorCode, "quality_status": string(qualityStatus)})
+		}
+	}
+	return err
 }
 
 func (w *Worker) sealCandidate(ctx context.Context, job graph.BuildJob, attempt graph.BuildAttempt, stats graph.RevisionStats, quality graph.QualityStatus) error {
@@ -267,6 +328,7 @@ func (w *Worker) sealCandidate(ctx context.Context, job graph.BuildJob, attempt 
 			}
 		}
 		if number < w.config.BatchAttempts {
+			w.observer.Count("graph_worker_retries_total", 1, map[string]string{"status": "scheduled", "stage": "seal", "dependency": "neo4j"})
 			if err := waitContext(ctx, delay); err != nil {
 				return err
 			}
@@ -279,7 +341,7 @@ func (w *Worker) sealCandidate(ctx context.Context, job graph.BuildJob, attempt 
 	return &graph.DomainError{Code: graph.ErrActivationOutcomeUnknown, Operation: "graph_worker", Stage: "seal", Dependency: "neo4j", Message: "graph candidate seal outcome is unknown", Retryable: true, Cause: lastErr}
 }
 
-func (w *Worker) retryBatch(ctx context.Context, operation func() error) error {
+func (w *Worker) retryBatch(ctx context.Context, stage, dependency string, operation func() error) error {
 	delay := w.config.RetryInitialBackoff
 	for attempt := 1; attempt <= w.config.BatchAttempts; attempt++ {
 		err := operation()
@@ -289,6 +351,7 @@ func (w *Worker) retryBatch(ctx context.Context, operation func() error) error {
 		if attempt == w.config.BatchAttempts || !retryableError(err) {
 			return err
 		}
+		w.observer.Count("graph_worker_retries_total", 1, map[string]string{"status": "scheduled", "stage": stage, "dependency": dependency})
 		if err := waitContext(ctx, delay); err != nil {
 			return err
 		}
@@ -345,7 +408,13 @@ func (g *leaseGuard) renew(ctx context.Context) error {
 	expiresAt := g.worker.clock.Now().UTC().Add(g.worker.config.LeaseDuration)
 	controlCtx, cancel := context.WithTimeout(ctx, g.worker.config.ControlTimeout)
 	defer cancel()
-	return g.worker.buildStore.HeartbeatGraphBuild(controlCtx, g.job.JobID, g.attempt.AttemptID, g.attempt.LeaseOwner, g.attempt.Fence, expiresAt)
+	err := g.worker.buildStore.HeartbeatGraphBuild(controlCtx, g.job.JobID, g.attempt.AttemptID, g.attempt.LeaseOwner, g.attempt.Fence, expiresAt)
+	status := "succeeded"
+	if err != nil {
+		status = "failed"
+	}
+	g.worker.observer.Count("graph_worker_heartbeats_total", 1, map[string]string{"status": status})
+	return err
 }
 
 func (g *leaseGuard) stop() {
@@ -381,27 +450,7 @@ func completedRevision(job graph.BuildJob, attempt graph.BuildAttempt, stats gra
 		GraphSchemaVersion: job.Versions.GraphSchemaVersion, BuildPolicyVersion: job.Versions.BuildPolicyVersion,
 		QualityStatus: qualityStatus, Quality: quality, RequestFingerprint: job.RequestFingerprint, Stats: stats,
 	}
-	event := common.EventEnvelope{
-		EventID: job.EventID, EventType: "graph.published.v1", AggregateID: revision.RevisionID,
-		OccurredAt: now, Producer: "code-knowledge-graph", PayloadVersion: 1, TraceID: job.Scope.TraceID,
-		Payload: map[string]any{
-			"tenant_id": job.Scope.TenantID, "repository_id": job.Scope.RepositoryID,
-			"snapshot_id": job.Scope.SnapshotID, "commit_sha": job.CommitSHA,
-			"revision_id": revision.RevisionID, "event_id": job.EventID,
-			"parser_result_version": job.Versions.ParserResultVersion,
-			"graph_schema_version":  job.Versions.GraphSchemaVersion,
-			"algorithm_version":     job.Versions.GraphAlgorithmVersion,
-			"build_policy_version":  job.Versions.BuildPolicyVersion,
-			"quality_status":        string(qualityStatus), "nodes": stats.Nodes, "edges": stats.Edges,
-			"unresolved_targets": stats.UnresolvedTargets, "ambiguous_relations": stats.AmbiguousRelations,
-			"input_artifacts": quality.InputArtifacts, "written_artifacts": quality.WrittenArtifacts,
-			"invalid_artifacts": quality.InvalidArtifacts, "input_relations": quality.InputRelations,
-			"written_relations": quality.WrittenRelations, "invalid_relations": quality.InvalidRelations,
-			"resolution_counts": quality.ResolutionCounts, "error_counts": quality.ErrorCounts,
-			"error_samples": quality.ErrorSamples,
-			"trace_id":      job.Scope.TraceID,
-		},
-	}
+	event := newPublishedEvent(revision, job.EventID, now)
 	revision.PublishedEvent = event
 	return revision, event
 }

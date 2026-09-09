@@ -20,6 +20,7 @@ type GraphControlStore struct{ pool *pgxpool.Pool }
 
 var (
 	_ ports.GraphBuildStore               = (*GraphControlStore)(nil)
+	_ ports.GraphBuildConcurrencyStore    = (*GraphControlStore)(nil)
 	_ ports.GraphBuildAdmissionStore      = (*GraphControlStore)(nil)
 	_ ports.GraphOutboxStore              = (*GraphControlStore)(nil)
 	_ ports.GraphRejectedEventStore       = (*GraphControlStore)(nil)
@@ -201,6 +202,17 @@ func (s *GraphControlStore) graphJobByFingerprint(ctx context.Context, fingerpri
 }
 
 func (s *GraphControlStore) ClaimGraphBuild(ctx context.Context, owner, attemptID, revisionID string, now time.Time, lease time.Duration) (graph.BuildJob, graph.BuildAttempt, bool, error) {
+	return s.claimGraphBuild(ctx, owner, attemptID, revisionID, now, lease, 0, 0, 0)
+}
+
+func (s *GraphControlStore) ClaimGraphBuildWithinLimits(ctx context.Context, owner, attemptID, revisionID string, now time.Time, lease time.Duration, maxGlobal, maxTenant, maxRepository int) (graph.BuildJob, graph.BuildAttempt, bool, error) {
+	if maxGlobal <= 0 || maxGlobal > 1_000_000 || maxTenant <= 0 || maxTenant > maxGlobal || maxRepository != 1 {
+		return graph.BuildJob{}, graph.BuildAttempt{}, false, invalidControlInput("build concurrency must be positive, tenant must not exceed global, and repository must equal one")
+	}
+	return s.claimGraphBuild(ctx, owner, attemptID, revisionID, now, lease, maxGlobal, maxTenant, maxRepository)
+}
+
+func (s *GraphControlStore) claimGraphBuild(ctx context.Context, owner, attemptID, revisionID string, now time.Time, lease time.Duration, maxGlobal, maxTenant, maxRepository int) (graph.BuildJob, graph.BuildAttempt, bool, error) {
 	if strings.TrimSpace(owner) == "" || strings.TrimSpace(attemptID) == "" || strings.TrimSpace(revisionID) == "" || now.IsZero() || lease <= 0 {
 		return graph.BuildJob{}, graph.BuildAttempt{}, false, invalidControlInput("owner, attempt_id, revision_id, now and a positive lease are required")
 	}
@@ -210,6 +222,11 @@ func (s *GraphControlStore) ClaimGraphBuild(ctx context.Context, owner, attemptI
 		return graph.BuildJob{}, graph.BuildAttempt{}, false, controlStoreError("claim", err)
 	}
 	defer tx.Rollback(ctx)
+	if maxGlobal > 0 {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('graph-build-claim',0))`); err != nil {
+			return graph.BuildJob{}, graph.BuildAttempt{}, false, controlStoreError("claim_concurrency_lock", err)
+		}
+	}
 
 	var jobID string
 	err = tx.QueryRow(ctx, `SELECT j.job_id FROM graph_build_jobs j
@@ -219,8 +236,17 @@ WHERE j.cancel_requested=false
     SELECT 1 FROM graph_build_attempts a
     WHERE a.job_id=j.job_id AND a.status='RUNNING' AND a.lease_expires_at>$1
   )
+	AND ($2=0 OR (SELECT count(*) FROM graph_build_attempts ga
+		WHERE ga.status='RUNNING' AND ga.lease_expires_at>$1) < $2)
+	AND ($3=0 OR (SELECT count(*) FROM graph_build_attempts ta
+		JOIN graph_build_jobs tj ON tj.job_id=ta.job_id
+		WHERE ta.status='RUNNING' AND ta.lease_expires_at>$1 AND tj.tenant_id=j.tenant_id) < $3)
+	AND ($4=0 OR (SELECT count(*) FROM graph_build_attempts ra
+		JOIN graph_build_jobs rj ON rj.job_id=ra.job_id
+		WHERE ra.status='RUNNING' AND ra.lease_expires_at>$1
+		  AND rj.tenant_id=j.tenant_id AND rj.repository_id=j.repository_id) < $4)
 ORDER BY j.created_at,j.job_id
-FOR UPDATE OF j SKIP LOCKED LIMIT 1`, now).Scan(&jobID)
+FOR UPDATE OF j SKIP LOCKED LIMIT 1`, now, maxGlobal, maxTenant, maxRepository).Scan(&jobID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return graph.BuildJob{}, graph.BuildAttempt{}, false, nil
 	}

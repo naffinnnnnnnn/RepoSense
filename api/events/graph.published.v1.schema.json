@@ -11,18 +11,61 @@
     "occurred_at": {"type": "string", "format": "date-time"},
     "producer": {"const": "code-knowledge-graph"},
     "payload_version": {"const": 1},
-    "trace_id": {"type": "string"},
+    "trace_id": {"type": "string", "minLength": 1},
     "payload": {
       "type": "object",
-      "required": ["revision_id", "snapshot_id", "commit_sha", "nodes", "edges", "unresolved_targets", "algorithm_version"],
+      "required": [
+        "tenant_id", "repository_id", "snapshot_id", "commit_sha", "revision_id", "event_id",
+        "parser_result_version", "graph_schema_version", "algorithm_version", "build_policy_version",
+        "quality_status", "nodes", "edges", "unresolved_targets", "ambiguous_relations",
+        "input_artifacts", "written_artifacts", "invalid_artifacts",
+        "input_relations", "written_relations", "invalid_relations",
+        "resolution_counts", "error_counts", "error_samples", "trace_id"
+      ],
       "properties": {
+        "tenant_id": {"type": "string", "minLength": 1},
+        "repository_id": {"type": "string", "minLength": 1},
         "revision_id": {"type": "string", "minLength": 1},
         "snapshot_id": {"type": "string", "minLength": 1},
         "commit_sha": {"type": "string", "minLength": 1},
+        "event_id": {"type": "string", "minLength": 1},
+        "parser_result_version": {"type": "string", "minLength": 1},
+        "graph_schema_version": {"type": "string", "minLength": 1},
+        "algorithm_version": {"type": "string", "minLength": 1},
+        "build_policy_version": {"type": "string", "minLength": 1},
+        "quality_status": {"enum": ["HEALTHY", "DEGRADED"]},
         "nodes": {"type": "integer", "minimum": 0},
         "edges": {"type": "integer", "minimum": 0},
         "unresolved_targets": {"type": "integer", "minimum": 0},
-        "algorithm_version": {"type": "string", "minLength": 1}
+        "ambiguous_relations": {"type": "integer", "minimum": 0},
+        "input_artifacts": {"type": "integer", "minimum": 0},
+        "written_artifacts": {"type": "integer", "minimum": 0},
+        "invalid_artifacts": {"type": "integer", "minimum": 0},
+        "input_relations": {"type": "integer", "minimum": 0},
+        "written_relations": {"type": "integer", "minimum": 0},
+        "invalid_relations": {"type": "integer", "minimum": 0},
+        "resolution_counts": {
+          "type": "object",
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        },
+        "error_counts": {
+          "type": "object",
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        },
+        "error_samples": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["record_type", "record_id", "error_code"],
+            "properties": {
+              "record_type": {"type": "string", "minLength": 1},
+              "record_id": {"type": "string", "minLength": 1},
+              "error_code": {"type": "string", "minLength": 1}
+            },
+            "additionalProperties": false
+          }
+        },
+        "trace_id": {"type": "string", "minLength": 1}
       },
       "additionalProperties": false
     }
